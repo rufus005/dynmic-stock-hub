@@ -22,6 +22,10 @@ vi.mock('firebase/database', () => ({
   push: firebaseCalls.push,
 }));
 
+function flushFirebaseQueue() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
 function initialBranches(): Branch[] {
   return [
     {
@@ -54,6 +58,30 @@ describe('store Firebase product writes', () => {
     vi.clearAllMocks();
   });
 
+  it('blocks full products root writes, deletes, empty updates, and negative stock', async () => {
+    const protection = await import('./firebaseProtection');
+
+    await expect(protection.safeSetPath('products', [], { action: 'set', entity: 'products' }))
+      .rejects.toThrow('Blocked unsafe Firebase write path');
+    await expect(protection.safeSetPath('/products', [], { action: 'set', entity: 'products' }))
+      .rejects.toThrow('Blocked unsafe Firebase write path');
+    await expect(protection.safeUpdatePaths({ products: [] }, { action: 'update', entity: 'products' }))
+      .rejects.toThrow('Blocked unsafe Firebase write path');
+    await expect(protection.safeSoftDeletePath('products', { entity: 'products' }))
+      .rejects.toThrow('Blocked unsafe Firebase write path');
+    await expect(protection.safeUpdatePaths({}, { action: 'update', entity: 'products-child' }))
+      .rejects.toThrow('Firebase update has no child paths');
+    await expect(protection.safeSetPath(
+      'products/0/dateEntries/0/stock/0',
+      { id: 'stock-1', quantity: -1 },
+      { action: 'set', entity: 'products-child' }
+    )).rejects.toThrow('Blocked negative stock quantity');
+
+    expect(firebaseCalls.set).not.toHaveBeenCalled();
+    expect(firebaseCalls.update).not.toHaveBeenCalled();
+    expect(firebaseCalls.remove).not.toHaveBeenCalled();
+  });
+
   it('writes sales, stock, dates, and transfers only to exact products child paths', async () => {
     const store = await import('./store');
     let branches = store.initCache(initialBranches());
@@ -80,6 +108,7 @@ describe('store Firebase product writes', () => {
       quantity: 3,
     });
     branches = store.transferStock('branch-1', 'branch-2', '2026-06-01', 'JUMBO', 'Ivory', '5', 1);
+    await flushFirebaseQueue();
 
     const setPaths = firebaseCalls.set.mock.calls.map(([refArg]) => refArg.path);
     expect(setPaths).not.toContain('products');
@@ -126,6 +155,7 @@ describe('store Firebase product writes', () => {
       price: 100,
       driverCharge: 10,
     });
+    await flushFirebaseQueue();
 
     const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
     expect(updateKeys).toContain('products/1/dateEntries/1/sales/1');
@@ -259,6 +289,7 @@ describe('store Firebase product writes', () => {
     const saleId = branches[0].dateEntries.find(entry => entry.date === '2026-06-04')!.sales[0].id;
     expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-04')!.stock[0].quantity).toBe(294);
     expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-05')!.stock[0].quantity).toBe(293);
+    await flushFirebaseQueue();
     expect(firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates))).toContain('products/0/dateEntries/1');
 
     branches = store.updateSale('branch-1', '2026-06-04', saleId, { quantity: 2, price: 200 });

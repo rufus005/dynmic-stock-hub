@@ -2,7 +2,8 @@ import { createContext, useContext, useState, useEffect, ReactNode, useCallback,
 import { Branch, SalesEntry, StockItem, ProductionRecord, TransferRecord, DynamicCategory, CATEGORIES } from '@/lib/types';
 import * as store from '@/lib/store';
 import { db, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH, CATEGORIES_PATH, TAGS_PATH } from '@/lib/firebase';
-import { ref, onValue, set, push, remove } from 'firebase/database';
+import { ref, onValue, push } from 'firebase/database';
+import { safeSetPath, safeSoftDeletePath, safeUpdatePaths } from '@/lib/firebaseProtection';
 
 interface DataContextType {
   branches: Branch[];
@@ -36,6 +37,12 @@ interface DataContextType {
   updateTag: (id: string, name: string) => void;
   deleteTag: (id: string) => void;
   refresh: () => void;
+}
+
+function isVisibleSnapshotValue(value: unknown): boolean {
+  if (!value) return false;
+  if (typeof value !== 'object') return true;
+  return (value as { deleted?: boolean }).deleted !== true;
 }
 
 const DataContext = createContext<DataContextType | null>(null);
@@ -94,7 +101,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const unsubscribe = onValue(prodRef, (snapshot) => {
       const data = snapshot.val();
       if (!data) { setProductionHistory([]); return; }
-      const records: ProductionRecord[] = Object.values(data);
+      const records = Object.values(data as Record<string, unknown>)
+        .filter(isVisibleSnapshotValue) as ProductionRecord[];
       setProductionHistory(records);
     });
     return () => unsubscribe();
@@ -106,7 +114,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const unsubscribe = onValue(transRef, (snapshot) => {
       const data = snapshot.val();
       if (!data) { setTransferHistory([]); return; }
-      const records: TransferRecord[] = Object.values(data);
+      const records = Object.values(data as Record<string, unknown>)
+        .filter(isVisibleSnapshotValue) as TransferRecord[];
       setTransferHistory(records);
     });
     return () => unsubscribe();
@@ -127,15 +136,19 @@ export function DataProvider({ children }: { children: ReactNode }) {
             shelfSizes: [...config.shelfSizes],
             colors: [...config.colors],
           }));
-          set(ref(db, CATEGORIES_PATH), seedCats.reduce((acc, c) => {
-            acc[c.id] = c;
-            return acc;
-          }, {} as Record<string, DynamicCategory>));
+          safeUpdatePaths(
+            seedCats.reduce((acc, c) => {
+              acc[`${CATEGORIES_PATH}/${c.id}`] = c;
+              return acc;
+            }, {} as Record<string, DynamicCategory>),
+            { action: 'update', entity: 'categories', reason: 'seed default categories' }
+          );
           setCategories(seedCats);
         }
         return;
       }
-      const cats: DynamicCategory[] = Object.values(data);
+      const cats = Object.values(data as Record<string, unknown>)
+        .filter(isVisibleSnapshotValue) as DynamicCategory[];
       setCategories(cats);
     });
     return () => unsubscribe();
@@ -147,10 +160,12 @@ export function DataProvider({ children }: { children: ReactNode }) {
     const unsubscribe = onValue(tagsRef, (snapshot) => {
       const data = snapshot.val();
       if (!data) { setAvailableTags([]); return; }
-      const tags: { id: string; name: string }[] = Object.entries(data).map(([id, val]: [string, any]) => ({
-        id,
-        name: typeof val === 'string' ? val : val.name || '',
-      }));
+      const tags: { id: string; name: string }[] = Object.entries(data as Record<string, unknown>)
+        .filter(([, val]) => isVisibleSnapshotValue(val))
+        .map(([id, val]) => ({
+          id,
+          name: typeof val === 'string' ? val : String((val as { name?: unknown }).name || ''),
+        }));
       setAvailableTags(tags);
     });
     return () => unsubscribe();
@@ -255,33 +270,32 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const addCategoryFn = useCallback((cat: Omit<DynamicCategory, 'id'>) => {
     const id = crypto.randomUUID();
     const newCat = { ...cat, id };
-    set(ref(db, `${CATEGORIES_PATH}/${id}`), newCat);
+    safeSetPath(`${CATEGORIES_PATH}/${id}`, newCat, { action: 'set', entity: 'categories' });
   }, []);
 
   const updateCategoryFn = useCallback((id: string, updates: Partial<DynamicCategory>) => {
-    const catRef = ref(db, `${CATEGORIES_PATH}/${id}`);
     const current = categories.find(c => c.id === id);
     if (current) {
-      set(catRef, { ...current, ...updates });
+      safeSetPath(`${CATEGORIES_PATH}/${id}`, { ...current, ...updates }, { action: 'set', entity: 'categories' });
     }
   }, [categories]);
 
   const deleteCategoryFn = useCallback((id: string) => {
-    remove(ref(db, `${CATEGORIES_PATH}/${id}`));
+    safeSoftDeletePath(`${CATEGORIES_PATH}/${id}`, { entity: 'categories', reason: 'category soft delete' });
   }, []);
 
   // Tags CRUD
   const addTagFn = useCallback((name: string) => {
     const newRef = push(ref(db, TAGS_PATH));
-    set(newRef, { id: newRef.key, name });
+    safeSetPath(`${TAGS_PATH}/${newRef.key}`, { id: newRef.key, name }, { action: 'set', entity: 'tags' });
   }, []);
 
   const updateTagFn = useCallback((id: string, name: string) => {
-    set(ref(db, `${TAGS_PATH}/${id}`), { id, name });
+    safeSetPath(`${TAGS_PATH}/${id}`, { id, name }, { action: 'set', entity: 'tags' });
   }, []);
 
   const deleteTagFn = useCallback((id: string) => {
-    remove(ref(db, `${TAGS_PATH}/${id}`));
+    safeSoftDeletePath(`${TAGS_PATH}/${id}`, { entity: 'tags', reason: 'tag soft delete' });
   }, []);
 
   return (

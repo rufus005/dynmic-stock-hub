@@ -1,7 +1,8 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { UserAccount } from '@/lib/types';
 import { db, USERS_PATH } from '@/lib/firebase';
-import { ref, onValue, set } from 'firebase/database';
+import { ref, onValue } from 'firebase/database';
+import { safeSetPath, safeSoftDeletePath, safeUpdatePaths } from '@/lib/firebaseProtection';
 
 interface AuthContextType {
   isAuthenticated: boolean;
@@ -24,8 +25,8 @@ const DEFAULT_ADMIN: UserAccount = {
   branchId: null,
 };
 
-function saveUsers(users: UserAccount[]) {
-  set(ref(db, USERS_PATH), users).catch(err => console.error('Firebase users write failed:', err));
+function isVisibleUser(value: unknown): value is UserAccount {
+  return !!value && typeof value === 'object' && (value as { deleted?: boolean }).deleted !== true;
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -46,10 +47,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (!data || (Array.isArray(data) && data.length === 0)) {
         // Seed default admin
         const seeded = [DEFAULT_ADMIN];
-        saveUsers(seeded);
+        safeSetPath(`${USERS_PATH}/${DEFAULT_ADMIN.id}`, DEFAULT_ADMIN, { action: 'set', entity: 'users', reason: 'seed default admin' });
         setUsers(seeded);
       } else {
-        const list: UserAccount[] = Array.isArray(data) ? data.filter(Boolean) : Object.values(data);
+        const list = (Array.isArray(data) ? data : Object.values(data as Record<string, unknown>))
+          .filter(isVisibleUser);
         setUsers(list);
       }
     });
@@ -79,19 +81,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const newUser: UserAccount = { ...user, id: crypto.randomUUID() };
     const updated = [...users, newUser];
     setUsers(updated);
-    saveUsers(updated);
+    safeSetPath(`${USERS_PATH}/${newUser.id}`, newUser, { action: 'set', entity: 'users' });
   };
 
   const updateUser = (id: string, updates: Partial<UserAccount>) => {
     const updated = users.map(u => u.id === id ? { ...u, ...updates } : u);
     setUsers(updated);
-    saveUsers(updated);
+    const childUpdates = Object.entries(updates).reduce((acc, [key, value]) => {
+      acc[`${USERS_PATH}/${id}/${key}`] = value;
+      return acc;
+    }, {} as Record<string, unknown>);
+    safeUpdatePaths(childUpdates, { action: 'update', entity: 'users' });
   };
 
   const deleteUser = (id: string) => {
     const updated = users.filter(u => u.id !== id);
     setUsers(updated);
-    saveUsers(updated);
+    safeSoftDeletePath(`${USERS_PATH}/${id}`, { entity: 'users', reason: 'user soft delete' });
   };
 
   return (

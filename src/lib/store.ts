@@ -1,6 +1,15 @@
 import { Branch, SalesEntry, StockItem, DateEntry, createDefaultStock, ProductionRecord, TransferRecord } from './types';
 import { db, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH } from './firebase';
-import { ref, set, push, update, remove } from 'firebase/database';
+import { ref, push } from 'firebase/database';
+import {
+  assertNonNegativeQuantity,
+  assertValidBranch,
+  assertValidDateEntry,
+  createFirebaseBackup,
+  safeSetPath,
+  safeSoftDeletePath,
+  safeUpdatePaths,
+} from './firebaseProtection';
 
 function migrateDoubleDeckorColor(stock: StockItem[]): StockItem[] {
   return stock.map(item => {
@@ -37,6 +46,27 @@ let nextBranchIndex = 0;
 let nextDateEntryIndexByBranchId = new Map<string, number>();
 let nextStockIndexByBranchDate = new Map<string, number>();
 let nextSaleIndexByBranchDate = new Map<string, number>();
+let pendingBackupPromises: Promise<void>[] = [];
+
+type FirebaseRecord = Record<string, unknown> & {
+  id?: string;
+  name?: string;
+  date?: string;
+  deleted?: boolean;
+  dateEntries?: unknown;
+  stock?: unknown;
+  sales?: unknown;
+  product?: string;
+  color?: string;
+};
+
+function isFirebaseRecord(value: unknown): value is FirebaseRecord {
+  return !!value && typeof value === 'object';
+}
+
+function isActiveFirebaseRecord(value: unknown): value is FirebaseRecord {
+  return isFirebaseRecord(value) && value.deleted !== true;
+}
 
 // Never call set() on `/products`; it can overwrite all branch data.
 function productPath(...segments: (string | number)[]): string {
@@ -154,17 +184,28 @@ function rememberNextSaleIndex(branchId: string, date: string, saleIndex: number
 function writeProductChild(pathSegments: (string | number)[], value: unknown) {
   const path = productPath(...pathSegments);
   console.log('[Firebase child write]', { path });
-  set(ref(db, path), value)
+  safeSetPath(path, value, { action: 'set', entity: 'products-child' })
     .then(() => console.log('[Firebase child write result]', { path, result: 'success' }))
     .catch(err => console.error('[Firebase child write result]', { path, result: 'error', error: err }));
 }
 
-function updateProductChildren(updates: Record<string, unknown>) {
-  update(ref(db), updates).catch(err => console.error('Firebase write failed:', err));
+function updateProductChildren(updates: Record<string, unknown>, reason = 'products child update') {
+  const backups = pendingBackupPromises;
+  pendingBackupPromises = [];
+  const backupBarrier = backups.length > 0 ? Promise.all(backups).then(() => undefined) : Promise.resolve();
+  backupBarrier
+    .then(() => safeUpdatePaths(updates, { action: 'update', entity: 'products-child', reason }))
+    .catch(err => console.error('Firebase backup/write failed:', err));
 }
 
-function removeProductChild(pathSegments: (string | number)[]) {
-  remove(ref(db, productPath(...pathSegments))).catch(err => console.error('Firebase delete failed:', err));
+function softDeleteProductChild(pathSegments: (string | number)[], reason = 'products child soft delete') {
+  const path = productPath(...pathSegments);
+  safeSoftDeletePath(path, { entity: 'products-child', reason })
+    .catch(err => console.error('Firebase soft delete failed:', err));
+}
+
+function backupBranchBeforeRecalculation(branchIndex: number, branch: Branch, reason: string) {
+  pendingBackupPromises.push(createFirebaseBackup(productPath(branchIndex), branch, reason));
 }
 
 function stockKey(item: Pick<StockItem, 'category' | 'color'> & { shelfSize?: string }): string {
@@ -209,6 +250,21 @@ function totalStockQuantity(stock: StockItem[]): number {
   return stock.reduce((sum, item) => sum + item.quantity, 0);
 }
 
+function totalSalesQuantity(entry: DateEntry): number {
+  return entry.sales.reduce((sum, sale) => sum + sale.quantity, 0);
+}
+
+function nonZeroStockRows(stock: StockItem[]) {
+  return stock
+    .filter(item => item.quantity > 0)
+    .map(item => ({
+      category: item.category,
+      shelfSize: item.shelfSize || '',
+      color: item.color,
+      quantity: item.quantity,
+    }));
+}
+
 function recalculateFutureDateEntries(
   branches: Branch[],
   branch: Branch,
@@ -249,6 +305,7 @@ function recalculateFutureDateEntries(
       transferOut: 0,
       soldQty: Array.from(soldByKey.values()).reduce((sum, qty) => sum + qty, 0),
       closingStock: totalStockQuantity(closingStock),
+      recalculatedStock: totalStockQuantity(closingStock),
       previousSnapshotStock: totalStockQuantity(previousSnapshot),
       stockKeys: Array.from(new Set([...openingStock.map(stockKey), ...soldByKey.keys()])).map(key => ({
         key,
@@ -276,16 +333,18 @@ function migrateFromLocalStorage(): Branch[] | null {
     if (!raw) return null;
     const data = JSON.parse(raw);
     if (!Array.isArray(data) || data.length === 0) return null;
-    const migrated = data.map((b: any) => {
-      if (!b || !b.id || !b.name) return null;
+    const migrated = data.map((b: unknown) => {
+      if (!isFirebaseRecord(b) || !b.id || !b.name) return null;
       if (Array.isArray(b.dateEntries)) return b as Branch;
       const dateEntries: DateEntry[] = [];
       const today = new Date().toISOString().split('T')[0];
       const oldStock = Array.isArray(b.stock) ? b.stock : [];
       const oldSales = Array.isArray(b.sales) ? b.sales : [];
-      const stockWithIds = oldStock.map((s: any) => ({ ...s, id: s.id || crypto.randomUUID() }));
+      const stockWithIds = oldStock
+        .filter(isFirebaseRecord)
+        .map((s) => ({ ...s, id: s.id || crypto.randomUUID() })) as StockItem[];
       if (stockWithIds.length > 0 || oldSales.length > 0) {
-        dateEntries.push({ date: today, stock: stockWithIds, sales: oldSales });
+        dateEntries.push({ date: today, stock: stockWithIds, sales: oldSales as SalesEntry[] });
       }
       return { id: b.id, name: b.name, dateEntries } as Branch;
     }).filter(Boolean) as Branch[];
@@ -295,7 +354,7 @@ function migrateFromLocalStorage(): Branch[] | null {
   }
 }
 
-function sanitizeBranches(data: any): Branch[] {
+function sanitizeBranches(data: unknown): Branch[] {
   branchIndexById = new Map<string, number>();
   dateEntryIndexByBranchDate = new Map<string, number>();
   stockIndexByBranchDateStockId = new Map<string, number>();
@@ -306,25 +365,39 @@ function sanitizeBranches(data: any): Branch[] {
   nextSaleIndexByBranchDate = new Map<string, number>();
   if (!Array.isArray(data)) return [];
   nextBranchIndex = data.length;
-  return data.map((b: any, branchIndex) => {
-    if (!b || !b.id || !b.name) return null;
+  return data.map((b: unknown, branchIndex) => {
+    if (!isActiveFirebaseRecord(b) || !b.id || !b.name) return null;
     rememberBranchIndex(b.id, branchIndex);
-    const dateEntries = Array.isArray(b.dateEntries) ? b.dateEntries.map((d: any, entryIndex) => {
-      if (!d) return null;
+    const dateEntries = Array.isArray(b.dateEntries) ? b.dateEntries.map((d: unknown, entryIndex) => {
+      if (!isActiveFirebaseRecord(d)) return null;
       rememberDateEntryIndex(b.id, d.date || '', entryIndex);
       rememberNextDateEntryIndex(b.id, entryIndex + 1);
       const rawStock = Array.isArray(d.stock) ? d.stock : [];
       const rawSales = Array.isArray(d.sales) ? d.sales : [];
       rememberNextStockIndex(b.id, d.date || '', rawStock.length);
       rememberNextSaleIndex(b.id, d.date || '', rawSales.length);
-      const stock = deduplicateStock(migrateDoubleDeckorColor(rawStock.filter(Boolean)));
+      const stock = deduplicateStock(migrateDoubleDeckorColor(rawStock.filter(isActiveFirebaseRecord) as StockItem[]));
       stock.forEach((item) => {
-        if (item.id) rememberStockIndex(b.id, d.date || '', item.id, rawStock.findIndex((rawItem: StockItem | null) => rawItem?.id === item.id));
+        if (item.id) {
+          rememberStockIndex(
+            b.id,
+            d.date || '',
+            item.id,
+            rawStock.findIndex((rawItem) => isFirebaseRecord(rawItem) && rawItem.id === item.id)
+          );
+        }
       });
-      const sales = rawSales.filter(Boolean).map((s: any, compactSaleIndex) => {
+      const sales = rawSales.filter(isActiveFirebaseRecord).map((s, compactSaleIndex) => {
         const sale = s.product === 'DOUBLE DECKOR' && s.color === 'Coffee-Brown' ? { ...s, color: 'Coffee Beige' } : s;
-        if (sale.id) rememberSaleIndex(b.id, d.date || '', sale.id, rawSales.findIndex((rawSale: SalesEntry | null) => rawSale?.id === sale.id) ?? compactSaleIndex);
-        return sale;
+        if (sale.id) {
+          rememberSaleIndex(
+            b.id,
+            d.date || '',
+            sale.id,
+            rawSales.findIndex((rawSale) => isFirebaseRecord(rawSale) && rawSale.id === sale.id) ?? compactSaleIndex
+          );
+        }
+        return sale as SalesEntry;
       });
       return {
         date: d.date || '',
@@ -343,7 +416,7 @@ function sanitizeBranches(data: any): Branch[] {
   }).filter(Boolean) as Branch[];
 }
 
-export function initCache(data: any): Branch[] {
+export function initCache(data: unknown): Branch[] {
   const branches = sanitizeBranches(data);
   if (branches.length === 0 && !initialized) {
     const migrated = migrateFromLocalStorage();
@@ -363,7 +436,7 @@ export function initCache(data: any): Branch[] {
   return branches;
 }
 
-export function updateCache(data: any): Branch[] {
+export function updateCache(data: unknown): Branch[] {
   cachedBranches = sanitizeBranches(data);
   return cachedBranches;
 }
@@ -402,7 +475,7 @@ export function deleteBranch(id: string): Branch[] {
   const idx = getFirebaseBranchIndex(cachedBranches, id);
   const branches = cachedBranches.filter(b => b.id !== id);
   cachedBranches = branches;
-  if (idx !== -1) removeProductChild([idx]);
+  if (idx !== -1) softDeleteProductChild([idx], 'branch soft delete');
   return branches;
 }
 
@@ -411,7 +484,9 @@ export function addDateEntry(branchId: string, date: string, options?: { source?
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error(`Invalid date: ${date}`);
   if (branch.dateEntries.find(d => d.date === date)) {
     console.log('[Add date entry skipped]', {
       selectedDate: date,
@@ -439,6 +514,11 @@ export function addDateEntry(branchId: string, date: string, options?: { source?
     selectedDate: date,
     branchId,
     source: options?.source || 'manual',
+    openingStockDate: previousEntry?.date || null,
+    openingStock: previousEntry ? totalStockQuantity(previousEntry.stock) : 0,
+    closingStock: totalStockQuantity(newStock),
+    salesQuantity: 0,
+    recalculatedStock: totalStockQuantity(newStock),
     firebaseWritePath,
     updatedStateCount: branch.dateEntries.length,
   });
@@ -459,12 +539,14 @@ export function deleteDateEntry(branchId: string, date: string): Branch[] {
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  assertValidDateEntry(branch.dateEntries[entryIndex], date);
   branch.dateEntries = branch.dateEntries.filter(d => d.date !== date);
   cachedBranches = branches;
-  if (entryIndex !== -1) removeProductChild([firebaseBranchIndex, 'dateEntries', firebaseEntryIndex]);
+  if (entryIndex !== -1) softDeleteProductChild([firebaseBranchIndex, 'dateEntries', firebaseEntryIndex], 'date entry soft delete');
   return branches;
 }
 
@@ -473,21 +555,25 @@ export function updateStockItem(branchId: string, date: string, stockId: string,
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   if (!entry) return branches;
   const idx = getStockIndex(entry, stockId);
   const firebaseUpdates: Record<string, unknown> = {};
   if (idx !== -1) {
     entry.stock[idx] = { ...entry.stock[idx], ...updates };
+    assertNonNegativeQuantity(entry.stock[idx].quantity, 'stock quantity');
     const firebaseStockIndex = getFirebaseStockIndex(branchId, date, stockId, idx);
     firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[idx];
+    backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before stock item recalculation');
     recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   }
   cachedBranches = branches;
-  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates);
+  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates, 'stock item update');
   return branches;
 }
 
@@ -496,10 +582,13 @@ export function addStockItem(branchId: string, date: string, item: Omit<StockIte
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
+  assertNonNegativeQuantity(item.quantity, 'stock item quantity');
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   if (!entry) return branches;
   const firebaseUpdates: Record<string, unknown> = {};
   const existingIndex = entry.stock.findIndex(s => s.category === item.category && (s.shelfSize || '') === (item.shelfSize || '') && s.color === item.color);
@@ -514,9 +603,10 @@ export function addStockItem(branchId: string, date: string, item: Omit<StockIte
     rememberStockIndex(branchId, date, newItem.id, stockIndex);
     firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', stockIndex)] = newItem;
   }
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before stock receive recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates);
+  updateProductChildren(firebaseUpdates, 'stock item add/receive');
   return branches;
 }
 
@@ -525,17 +615,19 @@ export function deleteStockItem(branchId: string, date: string, stockId: string)
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   if (!entry) return branches;
   const stockIndex = getStockIndex(entry, stockId);
   entry.stock = entry.stock.filter(s => s.id !== stockId);
   cachedBranches = branches;
   if (stockIndex !== -1) {
     const firebaseStockIndex = getFirebaseStockIndex(branchId, date, stockId, stockIndex);
-    removeProductChild([firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex]);
+    softDeleteProductChild([firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex], 'stock item soft delete');
   }
   return branches;
 }
@@ -545,18 +637,22 @@ export function updateDateStock(branchId: string, date: string, stock: StockItem
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   if (!entry) return branches;
+  stock.forEach(item => assertNonNegativeQuantity(item.quantity, 'date stock quantity'));
   entry.stock = stock;
   const firebaseUpdates: Record<string, unknown> = {
     [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex)]: entry,
   };
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before date stock recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates);
+  updateProductChildren(firebaseUpdates, 'date stock update');
   return branches;
 }
 
@@ -565,10 +661,13 @@ export function addSale(branchId: string, date: string, sale: Omit<SalesEntry, '
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
+  assertNonNegativeQuantity(sale.quantity, 'sale quantity');
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   if (!entry) return branches;
   const newSale: SalesEntry = {
     ...sale,
@@ -588,9 +687,10 @@ export function addSale(branchId: string, date: string, sale: Omit<SalesEntry, '
     entry.stock[stockIndex].quantity = Math.max(0, entry.stock[stockIndex].quantity - sale.quantity);
     updates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[stockIndex];
   }
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before add sale recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, updates);
   cachedBranches = branches;
-  updateProductChildren(updates);
+  updateProductChildren(updates, 'add sale');
   return branches;
 }
 
@@ -599,10 +699,12 @@ export function updateSale(branchId: string, date: string, saleId: string, updat
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   if (!entry) return branches;
   const saleIdx = entry.sales.findIndex(s => s.id === saleId);
   if (saleIdx === -1) return branches;
@@ -610,6 +712,7 @@ export function updateSale(branchId: string, date: string, saleId: string, updat
   const oldStockIndex = getMatchingStockIndex(entry, oldSale.product, oldSale.color, oldSale.shelfSize || '');
   if (oldStockIndex !== -1) entry.stock[oldStockIndex].quantity += oldSale.quantity;
   const updatedSale = { ...oldSale, ...updates };
+  assertNonNegativeQuantity(updatedSale.quantity, 'sale quantity');
   updatedSale.collection = updatedSale.price - updatedSale.driverCharge;
   entry.sales[saleIdx] = updatedSale;
   const newStockIndex = getMatchingStockIndex(entry, updatedSale.product, updatedSale.color, updatedSale.shelfSize || '');
@@ -626,9 +729,10 @@ export function updateSale(branchId: string, date: string, saleId: string, updat
     const firebaseNewStockIndex = getFirebaseStockIndex(branchId, date, entry.stock[newStockIndex].id, newStockIndex);
     firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseNewStockIndex)] = entry.stock[newStockIndex];
   }
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before edit sale recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates);
+  updateProductChildren(firebaseUpdates, 'edit sale');
   return branches;
 }
 
@@ -637,10 +741,12 @@ export function deleteSale(branchId: string, date: string, saleId: string): Bran
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   if (!branch) return branches;
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   if (!entry) return branches;
   const saleIndex = entry.sales.findIndex(s => s.id === saleId);
   const sale = entry.sales[saleIndex];
@@ -653,10 +759,16 @@ export function deleteSale(branchId: string, date: string, saleId: string): Bran
     const firebaseStockIndex = getFirebaseStockIndex(branchId, date, entry.stock[stockIndex].id, stockIndex);
     firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[stockIndex];
   }
+  const firebaseSaleIndex = getFirebaseSaleIndex(branchId, date, saleId, saleIndex);
+  firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'sales', firebaseSaleIndex)] = {
+    ...sale,
+    deleted: true,
+    deletedAt: new Date().toISOString(),
+  };
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before delete sale recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates);
-  removeProductChild([firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'sales', getFirebaseSaleIndex(branchId, date, saleId, saleIndex)]);
+  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates, 'soft delete sale');
   return branches;
 }
 
@@ -664,10 +776,12 @@ export function transferStock(
   fromBranchId: string, toBranchId: string, date: string,
   product: string, color: string, shelfSize: string, quantity: number
 ): Branch[] {
+  assertNonNegativeQuantity(quantity, 'transfer quantity');
   const branches = structuredClone(cachedBranches);
   const fromBranchIndex = getBranchIndex(branches, fromBranchId);
   const firebaseFromBranchIndex = getFirebaseBranchIndex(branches, fromBranchId);
   const fromBranch = branches[fromBranchIndex];
+  assertValidBranch(fromBranch, fromBranchId);
   const fromEntryIndex = fromBranch ? getDateEntryIndex(fromBranch, date) : -1;
   const firebaseFromEntryIndex = getFirebaseDateEntryIndex(fromBranchId, date, fromEntryIndex);
   const fromEntry = fromBranch?.dateEntries[fromEntryIndex];
@@ -677,6 +791,7 @@ export function transferStock(
   const toBranchIndex = getBranchIndex(branches, toBranchId);
   const firebaseToBranchIndex = getFirebaseBranchIndex(branches, toBranchId);
   const toBranch = branches[toBranchIndex];
+  assertValidBranch(toBranch, toBranchId);
   if (!toBranch) return cachedBranches;
   fromItem.quantity -= quantity;
 
@@ -706,10 +821,12 @@ export function transferStock(
     rememberStockIndex(toBranchId, date, newStock.id, newStockIndex);
     firebaseUpdates[productPath(firebaseToBranchIndex, 'dateEntries', firebaseToEntryIndex)] = toEntry;
   }
+  backupBranchBeforeRecalculation(firebaseFromBranchIndex, fromBranch, 'before outgoing transfer recalculation');
+  backupBranchBeforeRecalculation(firebaseToBranchIndex, toBranch, 'before incoming transfer recalculation');
   recalculateFutureDateEntries(branches, fromBranch, fromBranchId, date, fromEntry.stock, firebaseUpdates);
   recalculateFutureDateEntries(branches, toBranch, toBranchId, date, toEntry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates);
+  updateProductChildren(firebaseUpdates, 'transfer stock');
   return branches;
 }
 
@@ -717,13 +834,16 @@ export function externalTransfer(
   branchId: string, date: string,
   product: string, color: string, shelfSize: string, quantity: number
 ): Branch[] {
+  assertNonNegativeQuantity(quantity, 'external transfer quantity');
   const branches = structuredClone(cachedBranches);
   const branchIndex = getBranchIndex(branches, branchId);
   const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
   const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
   const entryIndex = branch ? getDateEntryIndex(branch, date) : -1;
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
   const entry = branch?.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   const stockIndex = entry ? getMatchingStockIndex(entry, product, color, shelfSize) : -1;
   const item = entry && stockIndex !== -1 ? entry.stock[stockIndex] : null;
   if (!item || item.quantity < quantity) return cachedBranches;
@@ -731,40 +851,50 @@ export function externalTransfer(
   const firebaseUpdates: Record<string, unknown> = {
     [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', getFirebaseStockIndex(branchId, date, item.id, stockIndex))]: item,
   };
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before external transfer recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates);
+  updateProductChildren(firebaseUpdates, 'external transfer');
   return branches;
 }
 
 // History logging
 export function logProductionReceive(record: Omit<ProductionRecord, 'id'>) {
   const newRef = push(ref(db, PRODUCTION_HISTORY_PATH));
-  set(newRef, { ...record, id: newRef.key });
+  safeSetPath(`${PRODUCTION_HISTORY_PATH}/${newRef.key}`, { ...record, id: newRef.key }, { action: 'set', entity: 'production-history' });
 }
 
 export function logTransfer(record: Omit<TransferRecord, 'id'>) {
   const newRef = push(ref(db, TRANSFER_HISTORY_PATH));
-  set(newRef, { ...record, id: newRef.key });
+  safeSetPath(`${TRANSFER_HISTORY_PATH}/${newRef.key}`, { ...record, id: newRef.key }, { action: 'set', entity: 'transfer-history' });
 }
 
 export function updateTransferRecord(id: string, updates: Partial<TransferRecord>) {
-  // Find the record key in Firebase by scanning - use the id which is the push key
-  const recordRef = ref(db, `${TRANSFER_HISTORY_PATH}/${id}`);
-  update(recordRef, updates).catch(err => console.error('Failed to update transfer record:', err));
+  const childUpdates = Object.entries(updates).reduce((acc, [key, value]) => {
+    acc[`${TRANSFER_HISTORY_PATH}/${id}/${key}`] = value;
+    return acc;
+  }, {} as Record<string, unknown>);
+  safeUpdatePaths(childUpdates, { action: 'update', entity: 'transfer-history' })
+    .catch(err => console.error('Failed to update transfer record:', err));
 }
 
 export function deleteTransferRecord(id: string) {
-  remove(ref(db, `${TRANSFER_HISTORY_PATH}/${id}`)).catch(err => console.error('Failed to delete transfer record:', err));
+  safeSoftDeletePath(`${TRANSFER_HISTORY_PATH}/${id}`, { entity: 'transfer-history', reason: 'transfer history soft delete' })
+    .catch(err => console.error('Failed to delete transfer record:', err));
 }
 
 export function updateProductionRecord(id: string, updates: Partial<ProductionRecord>) {
-  const recordRef = ref(db, `${PRODUCTION_HISTORY_PATH}/${id}`);
-  update(recordRef, updates).catch(err => console.error('Failed to update production record:', err));
+  const childUpdates = Object.entries(updates).reduce((acc, [key, value]) => {
+    acc[`${PRODUCTION_HISTORY_PATH}/${id}/${key}`] = value;
+    return acc;
+  }, {} as Record<string, unknown>);
+  safeUpdatePaths(childUpdates, { action: 'update', entity: 'production-history' })
+    .catch(err => console.error('Failed to update production record:', err));
 }
 
 export function deleteProductionRecord(id: string) {
-  remove(ref(db, `${PRODUCTION_HISTORY_PATH}/${id}`)).catch(err => console.error('Failed to delete production record:', err));
+  safeSoftDeletePath(`${PRODUCTION_HISTORY_PATH}/${id}`, { entity: 'production-history', reason: 'production history soft delete' })
+    .catch(err => console.error('Failed to delete production record:', err));
 }
 
 // Aggregation helpers
@@ -784,17 +914,23 @@ export function getRecalculatedDateEntries(branch: Branch): DateEntry[] {
   const entries = structuredClone(branch.dateEntries).sort((a, b) => a.date.localeCompare(b.date));
   if (entries.length === 0) return [];
 
-  let previousClosingStock = entries[0].stock.map(item => ({ ...item }));
-  entries[0].stock = previousClosingStock;
-
-  for (let i = 1; i < entries.length; i++) {
-    const hasSales = entries[i].sales.length > 0;
-    const openingStock = previousClosingStock.map(item => ({ ...item }));
-    const closingStock = hasSales
-      ? cloneClosingStockWithSalesApplied(openingStock, entries[i])
-      : entries[i].stock.map(item => ({ ...item }));
-    entries[i].stock = closingStock;
-    previousClosingStock = closingStock;
+  const shouldAuditBranch = branch.name.toUpperCase().includes('JP');
+  for (const entry of entries) {
+    const rawSnapshotStock = totalStockQuantity(entry.stock);
+    const shouldLogEntry = shouldAuditBranch || rawSnapshotStock <= 5;
+    if (shouldLogEntry) {
+      console.log('[Stock ledger read audit]', {
+        branchId: branch.id,
+        branchName: branch.name,
+        date: entry.date,
+        rawFirebaseStock: rawSnapshotStock,
+        salesQuantity: totalSalesQuantity(entry),
+        closingStock: rawSnapshotStock,
+        recalculatedStock: rawSnapshotStock,
+        mode: 'stored-closing-snapshot',
+        nonZeroStockRows: nonZeroStockRows(entry.stock),
+      });
+    }
   }
 
   return entries;

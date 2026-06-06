@@ -19,3 +19,5 @@ export const PRODUCTION_HISTORY_PATH = 'production_history';
 export const TRANSFER_HISTORY_PATH = 'transfer_history';
 export const CATEGORIES_PATH = 'categories';
 export const TAGS_PATH = 'tags';
+export const AUDIT_LOGS_PATH = 'audit_logs';
+export const BACKUPS_PATH = 'backups';
