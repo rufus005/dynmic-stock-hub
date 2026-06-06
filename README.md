@@ -1,3 +1,3 @@
-# Welcome to your Lovable project
+# Dynamic Stock Hub
 
 TODO: Document your project here
