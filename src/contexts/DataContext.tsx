@@ -16,17 +16,17 @@ interface DataContextType {
   removeBranch: (id: string) => void;
   addDateEntry: (branchId: string, date: string, options?: { source?: string }) => void;
   deleteDateEntry: (branchId: string, date: string) => void;
-  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => Branch[];
+  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => Promise<Branch[]>;
   acceptStoredStockAsCorrect: (branchId: string, date: string) => Branch[];
-  addStockItem: (branchId: string, date: string, item: Omit<StockItem, 'id'>) => void;
+  addStockItem: (branchId: string, date: string, item: Omit<StockItem, 'id'>) => Promise<Branch[]>;
   updateStockItem: (branchId: string, date: string, stockId: string, updates: Partial<StockItem>) => void;
   deleteStockItem: (branchId: string, date: string, stockId: string) => void;
-  addSale: (branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => void;
-  updateSale: (branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => void;
-  deleteSale: (branchId: string, date: string, saleId: string) => void;
-  receiveStock: (branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => void;
-  transferStock: (fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => void;
-  externalTransfer: (branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => void;
+  addSale: (branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => Promise<Branch[]>;
+  updateSale: (branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => Promise<Branch[]>;
+  deleteSale: (branchId: string, date: string, saleId: string) => Promise<Branch[]>;
+  receiveStock: (branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => Promise<Branch[]>;
+  transferStock: (fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => Promise<Branch[]>;
+  externalTransfer: (branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => Promise<Branch[]>;
   updateTransferRecord: (id: string, updates: Partial<TransferRecord>) => void;
   deleteTransferRecord: (id: string) => void;
   updateProductionRecord: (id: string, updates: Partial<ProductionRecord>) => void;
@@ -37,7 +37,7 @@ interface DataContextType {
   addTag: (name: string) => void;
   updateTag: (id: string, name: string) => void;
   deleteTag: (id: string) => void;
-  refresh: () => void;
+  refresh: () => Promise<void>;
 }
 
 function isVisibleSnapshotValue(value: unknown): boolean {
@@ -79,11 +79,17 @@ export function DataProvider({ children }: { children: ReactNode }) {
         (sum, branch) => sum + branch.dateEntries.reduce((entrySum, entry) => entrySum + entry.sales.length, 0),
         0
       );
-      console.log('[Firebase products verification]', {
+      const manualStockEditCount = result.reduce(
+        (sum, branch) => sum + branch.dateEntries.filter(entry => Boolean(entry.manualStockEditedAt)).length,
+        0
+      );
+      console.log('[Firebase products verification - refetch results]', {
         rawProductsSnapshotCount,
         branchCount: result.length,
         dateEntriesCount,
         salesCount,
+        manualStockEditCount,
+        branches: result.map(b => ({ id: b.id, name: b.name, dateEntriesWithManualEdit: b.dateEntries.filter(e => e.manualStockEditedAt).map(e => ({ date: e.date, editedAt: e.manualStockEditedAt, reason: e.manualStockEditReason, stock: e.stock.length })) })),
       });
       console.log('[Date entry refresh verification]', {
         refetchedEntriesCount: dateEntriesCount,
@@ -172,7 +178,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
     return () => unsubscribe();
   }, []);
 
-  const refresh = useCallback(() => setBranches(store.getBranches()), []);
+  const refresh = useCallback(async () => {
+    const firebaseBranches = await store.refetchProductsFromFirebase('manual refresh');
+    setBranches(firebaseBranches);
+  }, []);
 
   const addBranch = useCallback((name: string) => setBranches(store.addBranch(name)), []);
   const updateBranchName = useCallback((id: string, name: string) => setBranches(store.updateBranch(id, { name })), []);
@@ -193,27 +202,48 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const deleteDateEntry = useCallback((branchId: string, date: string) => setBranches(store.deleteDateEntry(branchId, date)), []);
 
   const updateDateStock = useCallback((branchId: string, date: string, stock: StockItem[]) => {
-    const updatedBranches = store.updateDateStock(branchId, date, stock);
-    setBranches(updatedBranches);
-    return updatedBranches;
+    return store.updateDateStockAndRefetch(branchId, date, stock).then(updatedBranches => {
+      setBranches(updatedBranches);
+      return updatedBranches;
+    });
   }, []);
   const acceptStoredStockAsCorrect = useCallback((branchId: string, date: string) => {
     const updatedBranches = store.acceptStoredStockAsCorrect(branchId, date);
     setBranches(updatedBranches);
     return updatedBranches;
   }, []);
-  const addStockItemFn = useCallback((branchId: string, date: string, item: Omit<StockItem, 'id'>) => setBranches(store.addStockItem(branchId, date, item)), []);
+  const addStockItemFn = useCallback((branchId: string, date: string, item: Omit<StockItem, 'id'>) => {
+    return store.addStockItemAndRefetch(branchId, date, item).then(updatedBranches => {
+      setBranches(updatedBranches);
+      return updatedBranches;
+    });
+  }, []);
   const updateStockItemFn = useCallback((branchId: string, date: string, stockId: string, updates: Partial<StockItem>) => setBranches(store.updateStockItem(branchId, date, stockId, updates)), []);
   const deleteStockItemFn = useCallback((branchId: string, date: string, stockId: string) => setBranches(store.deleteStockItem(branchId, date, stockId)), []);
 
-  const addSaleFn = useCallback((branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => setBranches(store.addSale(branchId, date, sale)), []);
-  const updateSaleFn = useCallback((branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => setBranches(store.updateSale(branchId, date, saleId, updates)), []);
-  const deleteSaleFn = useCallback((branchId: string, date: string, saleId: string) => setBranches(store.deleteSale(branchId, date, saleId)), []);
+  const addSaleFn = useCallback((branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => {
+    return store.addSaleAndRefetch(branchId, date, sale).then(updatedBranches => {
+      setBranches(updatedBranches);
+      return updatedBranches;
+    });
+  }, []);
+  const updateSaleFn = useCallback((branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => {
+    return store.updateSaleAndRefetch(branchId, date, saleId, updates).then(updatedBranches => {
+      setBranches(updatedBranches);
+      return updatedBranches;
+    });
+  }, []);
+  const deleteSaleFn = useCallback((branchId: string, date: string, saleId: string) => {
+    return store.deleteSaleAndRefetch(branchId, date, saleId).then(updatedBranches => {
+      setBranches(updatedBranches);
+      return updatedBranches;
+    });
+  }, []);
 
-  const receiveStockFn = useCallback((branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => {
-    setBranches(store.addStockItem(branchId, date, item));
-    const branch = store.getBranches().find(b => b.id === branchId);
-    store.logProductionReceive({
+  const receiveStockFn = useCallback(async (branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => {
+    const updatedBranches = await store.addStockItemAndRefetch(branchId, date, item);
+    const branch = updatedBranches.find(b => b.id === branchId);
+    await store.logProductionReceive({
       date,
       branchId,
       branchName: branch?.name || '',
@@ -223,14 +253,15 @@ export function DataProvider({ children }: { children: ReactNode }) {
       quantity: item.quantity,
       fromName: fromName || '',
     });
+    setBranches(updatedBranches);
+    return updatedBranches;
   }, []);
 
-  const transferStockFn = useCallback((fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => {
-    setBranches(store.transferStock(fromBranchId, toBranchId, date, product, color, shelfSize, quantity));
-    const allBranches = store.getBranches();
-    const fromBranch = allBranches.find(b => b.id === fromBranchId);
-    const toBranch = allBranches.find(b => b.id === toBranchId);
-    store.logTransfer({
+  const transferStockFn = useCallback(async (fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => {
+    const updatedBranches = await store.transferStockAndRefetch(fromBranchId, toBranchId, date, product, color, shelfSize, quantity);
+    const fromBranch = updatedBranches.find(b => b.id === fromBranchId);
+    const toBranch = updatedBranches.find(b => b.id === toBranchId);
+    await store.logTransfer({
       date,
       type: 'internal',
       fromBranchId,
@@ -242,12 +273,14 @@ export function DataProvider({ children }: { children: ReactNode }) {
       shelfSize,
       quantity,
     });
+    setBranches(updatedBranches);
+    return updatedBranches;
   }, []);
 
-  const externalTransferFn = useCallback((branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => {
-    setBranches(store.externalTransfer(branchId, date, product, color, shelfSize, quantity));
-    const branch = store.getBranches().find(b => b.id === branchId);
-    store.logTransfer({
+  const externalTransferFn = useCallback(async (branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => {
+    const updatedBranches = await store.externalTransferAndRefetch(branchId, date, product, color, shelfSize, quantity);
+    const branch = updatedBranches.find(b => b.id === branchId);
+    await store.logTransfer({
       date,
       type: 'external',
       fromBranchId: branchId,
@@ -258,6 +291,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
       quantity,
       externalName: externalName || '',
     });
+    setBranches(updatedBranches);
+    return updatedBranches;
   }, []);
 
   const updateTransferRecordFn = useCallback((id: string, updates: Partial<TransferRecord>) => {

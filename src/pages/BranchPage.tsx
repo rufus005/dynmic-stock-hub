@@ -348,20 +348,21 @@ function DateDetailView({
   branches: Branch[];
   categories: DynamicCategory[];
   onBack: () => void;
-  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => Branch[];
+  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => Promise<Branch[]>;
   acceptStoredStockAsCorrect: (branchId: string, date: string) => Branch[];
-  addSale: (branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => void;
-  updateSale: (branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => void;
-  deleteSale: (branchId: string, date: string, saleId: string) => void;
-  addStockItem: (branchId: string, date: string, item: Omit<StockItem, 'id'>) => void;
-  receiveStock: (branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => void;
-  transferStock: (fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => void;
-  externalTransfer: (branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => void;
+  addSale: (branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => Promise<Branch[]>;
+  updateSale: (branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => Promise<Branch[]>;
+  deleteSale: (branchId: string, date: string, saleId: string) => Promise<Branch[]>;
+  addStockItem: (branchId: string, date: string, item: Omit<StockItem, 'id'>) => Promise<Branch[]>;
+  receiveStock: (branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => Promise<Branch[]>;
+  transferStock: (fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => Promise<Branch[]>;
+  externalTransfer: (branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => Promise<Branch[]>;
   userRole: 'admin' | 'branch';
 }) {
   const { productionHistory, transferHistory, availableTags, updateTransferRecord, deleteTransferRecord, updateProductionRecord, deleteProductionRecord } = useData();
   const [localStock, setLocalStock] = useState<StockItem[]>(dateEntry.stock);
   const [stockAuditRows, setStockAuditRows] = useState<StockAuditResult[] | null>(null);
+  const [savingStock, setSavingStock] = useState(false);
 
   // Build a category map for lookups
   const categoryMap = useMemo(() => {
@@ -507,13 +508,55 @@ function DateDetailView({
     setLocalStock(prev => prev.map(item => item.id === stockId ? { ...item, quantity: Math.max(0, qty) } : item));
   };
 
-  const saveStock = () => {
-    const updatedBranches = updateDateStock(branchId, dateEntry.date, localStock);
-    const updatedBranch = updatedBranches.find(item => item.id === branchId);
-    if (updatedBranch && stockAuditRows) {
-      setStockAuditRows(getStockAuditRows(updatedBranch));
+  const saveStock = async () => {
+    if (savingStock) return;
+    const oldStockTotal = dateEntry.stock.reduce((sum, item) => sum + item.quantity, 0);
+    const newStockTotal = localStock.reduce((sum, item) => sum + item.quantity, 0);
+    const oldStockDetails = dateEntry.stock.map(s => ({ id: s.id, category: s.category, color: s.color, shelfSize: s.shelfSize, qty: s.quantity }));
+    const newStockDetails = localStock.map(s => ({ id: s.id, category: s.category, color: s.color, shelfSize: s.shelfSize, qty: s.quantity }));
+    
+    console.log('[Admin save stock - initiated]', {
+      branchId,
+      date: dateEntry.date,
+      oldStockTotal,
+      newStockTotal,
+      itemCount: localStock.length,
+      oldStockDetails,
+      newStockDetails,
+    });
+
+    setSavingStock(true);
+    try {
+      const updatedBranches = await updateDateStock(branchId, dateEntry.date, localStock);
+      const updatedBranch = updatedBranches.find(item => item.id === branchId);
+      const updatedEntry = updatedBranch?.dateEntries.find(e => e.date === dateEntry.date);
+
+      console.log('[Admin save stock - completed from Firebase refetch]', {
+        branchId,
+        date: dateEntry.date,
+        manualStockEditedAt: updatedEntry?.manualStockEditedAt,
+        manualStockEditReason: updatedEntry?.manualStockEditReason,
+        firebaseRefetchStock: updatedEntry?.stock.map(s => ({ id: s.id, category: s.category, color: s.color, shelfSize: s.shelfSize, qty: s.quantity })),
+        dashboardTotalAfterRefetch: updatedBranches.reduce((total, branch) => {
+          const latest = [...branch.dateEntries].sort((a, b) => b.date.localeCompare(a.date))[0];
+          return total + (latest?.stock.reduce((sum, item) => sum + item.quantity, 0) || 0);
+        }, 0),
+      });
+
+      if (updatedBranch && stockAuditRows) {
+        setStockAuditRows(getStockAuditRows(updatedBranch));
+      }
+      toast.success('Stock saved');
+    } catch (error) {
+      console.error('[Admin save stock - Firebase failed]', {
+        branchId,
+        date: dateEntry.date,
+        error,
+      });
+      toast.error('Stock was not saved to Firebase. Please try again.');
+    } finally {
+      setSavingStock(false);
     }
-    toast.success('Stock saved');
   };
 
   const runStockAudit = () => {
@@ -576,7 +619,7 @@ function DateDetailView({
     }));
   };
 
-  const handleSale = (e: React.FormEvent) => {
+  const handleSale = async (e: React.FormEvent) => {
     e.preventDefault();
     const validItems = saleItems.filter(item => item.color && item.shelfSize && item.quantity > 0);
     if (validItems.length === 0) {
@@ -591,26 +634,28 @@ function DateDetailView({
         return;
       }
     }
-    for (const item of validItems) {
-      rememberDriverName(item.driverName);
-      addSale(branchId, dateEntry.date, {
-        date: dateEntry.date,
-        customerNumber: item.customerNumber,
-        driverName: item.driverName,
-        paymentMode: item.paymentMode || 'Cash',
-        product: item.product,
-        color: item.color,
-        shelfSize: item.shelfSize,
-        quantity: item.quantity,
-        price: item.price,
-        driverCharge: item.driverCharge,
-      });
+    try {
+      for (const item of validItems) {
+        rememberDriverName(item.driverName);
+        await addSale(branchId, dateEntry.date, {
+          date: dateEntry.date,
+          customerNumber: item.customerNumber,
+          driverName: item.driverName,
+          paymentMode: item.paymentMode || 'Cash',
+          product: item.product,
+          color: item.color,
+          shelfSize: item.shelfSize,
+          quantity: item.quantity,
+          price: item.price,
+          driverCharge: item.driverCharge,
+        });
+      }
+      toast.success(`${validItems.length} sale(s) added (${validItems.reduce((s, i) => s + i.quantity, 0)} total units)`);
+      setSaleItems([{ product: categoryNames[0] || 'JUMBO', color: '', shelfSize: '', quantity: 0, price: 0, driverCharge: 0, driverName: '', customerNumber: '', paymentMode: 'Cash' }]);
+    } catch (error) {
+      console.error('[Add sale - Firebase failed]', { branchId, date: dateEntry.date, error });
+      toast.error('Sale was not saved to Firebase. Please try again.');
     }
-    toast.success(`${validItems.length} sale(s) added (${validItems.reduce((s, i) => s + i.quantity, 0)} total units)`);
-    setSaleItems([{ product: categoryNames[0] || 'JUMBO', color: '', shelfSize: '', quantity: 0, price: 0, driverCharge: 0, driverName: '', customerNumber: '', paymentMode: 'Cash' }]);
-    setTimeout(() => {
-      setLocalStock(dateEntry.stock);
-    }, 100);
   };
 
   const handleEditSale = (sale: SalesEntry) => {
@@ -618,20 +663,30 @@ function DateDetailView({
     setEditSaleData({ ...sale });
   };
 
-  const handleSaveSaleEdit = () => {
+  const handleSaveSaleEdit = async () => {
     if (editingSaleId && editSaleData) {
-      rememberDriverName(editSaleData.driverName || '');
-      updateSale(branchId, dateEntry.date, editingSaleId, editSaleData);
-      setEditingSaleId(null);
-      setEditSaleData({});
-      toast.success('Sale updated');
+      try {
+        rememberDriverName(editSaleData.driverName || '');
+        await updateSale(branchId, dateEntry.date, editingSaleId, editSaleData);
+        setEditingSaleId(null);
+        setEditSaleData({});
+        toast.success('Sale updated');
+      } catch (error) {
+        console.error('[Edit sale - Firebase failed]', { branchId, date: dateEntry.date, saleId: editingSaleId, error });
+        toast.error('Sale update was not saved to Firebase. Please try again.');
+      }
     }
   };
 
-  const handleDeleteSale = (saleId: string) => {
+  const handleDeleteSale = async (saleId: string) => {
     if (confirm('Delete this sale? Stock will be restored.')) {
-      deleteSale(branchId, dateEntry.date, saleId);
-      toast.success('Sale deleted');
+      try {
+        await deleteSale(branchId, dateEntry.date, saleId);
+        toast.success('Sale deleted');
+      } catch (error) {
+        console.error('[Delete sale - Firebase failed]', { branchId, date: dateEntry.date, saleId, error });
+        toast.error('Sale delete was not saved to Firebase. Please try again.');
+      }
     }
   };
 
@@ -686,8 +741,8 @@ function DateDetailView({
               <Check className="w-4 h-4" /> Stock Audit
             </button>
             {userRole === 'admin' && (
-              <button onClick={saveStock} className="flex items-center gap-1.5 px-4 py-2 rounded-lg gradient-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity">
-                <Save className="w-4 h-4" /> Save Stock
+              <button onClick={saveStock} disabled={savingStock} className="flex items-center gap-1.5 px-4 py-2 rounded-lg gradient-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-60">
+                <Save className="w-4 h-4" /> {savingStock ? 'Saving...' : 'Save Stock'}
               </button>
             )}
           </div>
@@ -1165,7 +1220,7 @@ function DateDetailView({
         externalTransfer={externalTransfer}
         getColorsForProduct={getColorsForProduct}
         getSizesForProduct={getSizesForProduct}
-        onStockUpdated={() => setTimeout(() => setLocalStock(dateEntry.stock), 100)}
+        onStockUpdated={() => setLocalStock(dateEntry.stock)}
       />
     </div>
   );
@@ -1176,7 +1231,7 @@ function ReceiveStockForm({
 }: {
   branchId: string;
   date: string;
-  receiveStock: (branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => void;
+  receiveStock: (branchId: string, date: string, item: Omit<StockItem, 'id'>, fromName?: string) => Promise<Branch[]>;
   categoryNames: string[];
   getColorsForProduct: (product: string) => string[];
   getSizesForProduct: (product: string) => string[];
@@ -1196,20 +1251,25 @@ function ReceiveStockForm({
     setItems(prev => prev.filter((_, i) => i !== index));
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const validItems = items.filter(item => item.color && item.shelfSize && item.quantity > 0);
     if (validItems.length === 0) {
       toast.error('Please fill at least one item with color, size, and quantity');
       return;
     }
-    for (const item of validItems) {
-      receiveStock(branchId, date, { category: item.product, color: item.color, shelfSize: item.shelfSize, quantity: item.quantity }, fromName);
+    try {
+      for (const item of validItems) {
+        await receiveStock(branchId, date, { category: item.product, color: item.color, shelfSize: item.shelfSize, quantity: item.quantity }, fromName);
+      }
+      toast.success(`${validItems.length} product(s) received (${validItems.reduce((s, i) => s + i.quantity, 0)} total units)`);
+      setItems([{ product: categoryNames[0] || 'JUMBO', color: '', shelfSize: '', quantity: 0 }]);
+      setFromName('');
+      onStockUpdated();
+    } catch (error) {
+      console.error('[Receive production - Firebase failed]', { branchId, date, error });
+      toast.error('Production receive was not saved to Firebase. Please try again.');
     }
-    toast.success(`${validItems.length} product(s) received (${validItems.reduce((s, i) => s + i.quantity, 0)} total units)`);
-    setItems([{ product: categoryNames[0] || 'JUMBO', color: '', shelfSize: '', quantity: 0 }]);
-    setFromName('');
-    onStockUpdated();
   };
 
   return (
@@ -1287,8 +1347,8 @@ function TransferStockForm({
   branches: { id: string; name: string }[];
   localStock: StockItem[];
   categoryNames: string[];
-  transferStock: (fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => void;
-  externalTransfer: (branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => void;
+  transferStock: (fromBranchId: string, toBranchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number) => Promise<Branch[]>;
+  externalTransfer: (branchId: string, date: string, product: string, color: string, shelfSize: string, quantity: number, externalName?: string) => Promise<Branch[]>;
   getColorsForProduct: (product: string) => string[];
   getSizesForProduct: (product: string) => string[];
   onStockUpdated: () => void;
@@ -1317,7 +1377,7 @@ function TransferStockForm({
     return item?.quantity || 0;
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const validItems = items.filter(item => item.color && item.shelfSize && item.quantity > 0);
     if (validItems.length === 0) {
@@ -1335,24 +1395,29 @@ function TransferStockForm({
         return;
       }
     }
-    for (const item of validItems) {
-      if (transferType === 'internal') {
-        transferStock(branchId, toBranchId, date, item.product, item.color, item.shelfSize, item.quantity);
-      } else {
-        externalTransfer(branchId, date, item.product, item.color, item.shelfSize, item.quantity, externalName);
+    try {
+      for (const item of validItems) {
+        if (transferType === 'internal') {
+          await transferStock(branchId, toBranchId, date, item.product, item.color, item.shelfSize, item.quantity);
+        } else {
+          await externalTransfer(branchId, date, item.product, item.color, item.shelfSize, item.quantity, externalName);
+        }
       }
+      const totalQty = validItems.reduce((s, i) => s + i.quantity, 0);
+      if (transferType === 'internal') {
+        const destName = branches.find(b => b.id === toBranchId)?.name || 'destination';
+        toast.success(`${validItems.length} product(s) (${totalQty} units) transferred to ${destName}`);
+      } else {
+        toast.success(`${validItems.length} product(s) (${totalQty} units) sent to ${externalName || 'external'}`);
+      }
+      setToBranchId('');
+      setExternalName('');
+      setItems([{ product: categoryNames[0] || 'JUMBO', color: '', shelfSize: '', quantity: 0 }]);
+      onStockUpdated();
+    } catch (error) {
+      console.error('[Transfer stock - Firebase failed]', { branchId, date, transferType, error });
+      toast.error('Transfer was not saved to Firebase. Please try again.');
     }
-    const totalQty = validItems.reduce((s, i) => s + i.quantity, 0);
-    if (transferType === 'internal') {
-      const destName = branches.find(b => b.id === toBranchId)?.name || 'destination';
-      toast.success(`${validItems.length} product(s) (${totalQty} units) transferred to ${destName}`);
-    } else {
-      toast.success(`${validItems.length} product(s) (${totalQty} units) sent to ${externalName || 'external'}`);
-    }
-    setToBranchId('');
-    setExternalName('');
-    setItems([{ product: categoryNames[0] || 'JUMBO', color: '', shelfSize: '', quantity: 0 }]);
-    onStockUpdated();
   };
 
   return (

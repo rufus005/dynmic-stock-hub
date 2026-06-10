@@ -1,6 +1,6 @@
 import { Branch, SalesEntry, StockItem, DateEntry, createDefaultStock, ProductionRecord, TransferRecord } from './types';
-import { db, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH } from './firebase';
-import { ref, push } from 'firebase/database';
+import { db, firebaseConfig, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH } from './firebase';
+import { ref, push, get } from 'firebase/database';
 import {
   assertNonNegativeQuantity,
   assertValidBranch,
@@ -189,16 +189,39 @@ function writeProductChild(pathSegments: (string | number)[], value: unknown, op
     .catch(err => console.error('[Firebase child write result]', { path, result: 'error', error: err }));
 }
 
-function updateProductChildren(updates: Record<string, unknown>, options: Parameters<typeof safeUpdatePaths>[1] | string = 'products child update') {
+async function writeProductChildren(updates: Record<string, unknown>, options: Parameters<typeof safeUpdatePaths>[1] | string = 'products child update') {
   const backups = pendingBackupPromises;
   pendingBackupPromises = [];
   const backupBarrier = backups.length > 0 ? Promise.all(backups).then(() => undefined) : Promise.resolve();
   const writeOptions = typeof options === 'string'
     ? { action: 'update' as const, entity: 'products-child', reason: options }
     : { action: 'update' as const, entity: 'products-child', ...options };
-  backupBarrier
-    .then(() => safeUpdatePaths(updates, writeOptions))
-    .catch(err => console.error('Firebase backup/write failed:', err));
+  const updatePaths = Object.keys(updates);
+  console.log('[Firebase stock write pending]', {
+    databaseURL: firebaseConfig.databaseURL,
+    updatePaths,
+    oldStockValue: 'oldStock' in writeOptions ? writeOptions.oldStock : undefined,
+    newStockValue: 'newStock' in writeOptions ? writeOptions.newStock : undefined,
+  });
+  try {
+    await backupBarrier;
+    await safeUpdatePaths(updates, writeOptions);
+    console.log('[Firebase stock write success]', {
+      databaseURL: firebaseConfig.databaseURL,
+      updatePaths,
+    });
+  } catch (err) {
+    console.error('[Firebase stock write failure]', {
+      databaseURL: firebaseConfig.databaseURL,
+      updatePaths,
+      error: err,
+    });
+    throw err;
+  }
+}
+
+function updateProductChildren(updates: Record<string, unknown>, options: Parameters<typeof safeUpdatePaths>[1] | string = 'products child update') {
+  writeProductChildren(updates, options).catch(err => console.error('Firebase backup/write failed:', err));
 }
 
 function softDeleteProductChild(pathSegments: (string | number)[], reason = 'products child soft delete', options?: Omit<Parameters<typeof safeSoftDeletePath>[1], 'entity' | 'reason'>) {
@@ -518,6 +541,34 @@ export function updateCache(data: unknown): Branch[] {
   return cachedBranches;
 }
 
+export async function refetchProductsFromFirebase(reason = 'manual refresh'): Promise<Branch[]> {
+  console.log('[Firebase products refetch pending]', {
+    databaseURL: firebaseConfig.databaseURL,
+    path: PRODUCTS_PATH,
+    reason,
+  });
+  const snapshot = await get(ref(db, PRODUCTS_PATH));
+  const branches = updateCache(snapshot.val());
+  const dashboardTotalAfterRefetch = branches.reduce((total, branch) => {
+    const latest = getLatestDateEntry(branch);
+    return total + (latest?.stock.reduce((sum, item) => sum + item.quantity, 0) || 0);
+  }, 0);
+  console.log('[Firebase products refetch result]', {
+    databaseURL: firebaseConfig.databaseURL,
+    path: PRODUCTS_PATH,
+    reason,
+    branchCount: branches.length,
+    dashboardTotalAfterRefetch,
+    branches: branches.map(branch => ({
+      id: branch.id,
+      name: branch.name,
+      latestDate: getLatestDateEntry(branch)?.date || null,
+      latestStockTotal: getLatestDateEntry(branch)?.stock.reduce((sum, item) => sum + item.quantity, 0) || 0,
+    })),
+  });
+  return branches;
+}
+
 export function getBranches(): Branch[] {
   return cachedBranches;
 }
@@ -780,18 +831,265 @@ export function updateDateStock(branchId: string, date: string, stock: StockItem
   assertValidDateEntry(entry, date);
   if (!entry) return branches;
   stock.forEach(item => assertNonNegativeQuantity(item.quantity, 'date stock quantity'));
+
   const beforeStock = entry.stock.map(item => ({ ...item }));
+  const oldStockTotal = totalStockQuantity(beforeStock);
+
   entry.stock = stock;
   entry.manualStockEditedAt = new Date().toISOString();
   entry.manualStockEditReason = MANUAL_STOCK_EDIT_REASON;
-  const firebaseUpdates: Record<string, unknown> = {
-    [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex)]: entry,
-  };
-  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before date stock recalculation');
+
+  const newStockTotal = totalStockQuantity(stock);
+
+  // Write exact child paths for stock and metadata (no full entry write)
+  const firebaseUpdates: Record<string, unknown> = {};
+
+  // Write each stock item to its exact path
+  stock.forEach((item, idx) => {
+    const firebaseStockIndex = getFirebaseStockIndex(branchId, date, item.id, idx);
+    const stockPath = productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex);
+    firebaseUpdates[stockPath] = item;
+  });
+
+  // Write manual metadata to exact child paths
+  const metadataPath = productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex);
+  firebaseUpdates[`${metadataPath}/manualStockEditedAt`] = entry.manualStockEditedAt;
+  firebaseUpdates[`${metadataPath}/manualStockEditReason`] = entry.manualStockEditReason;
+
+  console.log('[Manual stock edit - exact child path write]', {
+    branchId,
+    date,
+    firebaseBranchIndex,
+    firebaseEntryIndex,
+    oldStockTotal,
+    newStockTotal,
+    stockItems: stock.length,
+    manualStockEditedAt: entry.manualStockEditedAt,
+    manualStockEditReason: entry.manualStockEditReason,
+    updatePaths: Object.keys(firebaseUpdates),
+    stockPaths: Object.keys(firebaseUpdates).filter(k => k.includes('/stock/')),
+  });
+
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before date stock manual edit recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'date stock update'));
+
+  const auditEntry = stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'date stock update');
+  console.log('[Manual stock edit - Firebase update payload]', {
+    branchId,
+    date,
+    updatePathCount: Object.keys(firebaseUpdates).length,
+    auditReason: auditEntry.reason,
+    oldStockSnapshot: auditEntry.oldStock,
+    newStockSnapshot: auditEntry.newStock,
+  });
+
+  updateProductChildren(firebaseUpdates, auditEntry);
+
   return branches;
+}
+
+export async function updateDateStockAndRefetch(branchId: string, date: string, stock: StockItem[]): Promise<Branch[]> {
+  const branches = structuredClone(cachedBranches);
+  const branchIndex = getBranchIndex(branches, branchId);
+  const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
+  const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
+  if (!branch) return refetchProductsFromFirebase('manual stock edit branch not found');
+  const entryIndex = getDateEntryIndex(branch, date);
+  const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
+  if (!entry) return refetchProductsFromFirebase('manual stock edit date entry not found');
+  stock.forEach(item => assertNonNegativeQuantity(item.quantity, 'date stock quantity'));
+
+  const beforeStock = entry.stock.map(item => ({ ...item }));
+  const oldStockTotal = totalStockQuantity(beforeStock);
+
+  entry.stock = stock;
+  entry.manualStockEditedAt = new Date().toISOString();
+  entry.manualStockEditReason = MANUAL_STOCK_EDIT_REASON;
+
+  const newStockTotal = totalStockQuantity(stock);
+  const firebaseUpdates: Record<string, unknown> = {};
+
+  stock.forEach((item, idx) => {
+    const firebaseStockIndex = getFirebaseStockIndex(branchId, date, item.id, idx);
+    const stockPath = productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex);
+    firebaseUpdates[stockPath] = item;
+  });
+
+  const metadataPath = productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex);
+  firebaseUpdates[`${metadataPath}/manualStockEditedAt`] = entry.manualStockEditedAt;
+  firebaseUpdates[`${metadataPath}/manualStockEditReason`] = entry.manualStockEditReason;
+
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before date stock manual edit recalculation');
+  recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
+
+  const auditEntry = stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'date stock update');
+  console.log('[Manual stock edit - Firebase authoritative save]', {
+    databaseURL: firebaseConfig.databaseURL,
+    branchId,
+    date,
+    firebaseBranchIndex,
+    firebaseEntryIndex,
+    oldStockValue: auditEntry.oldStock,
+    newStockValue: auditEntry.newStock,
+    oldStockTotal,
+    newStockTotal,
+    firebaseWritePaths: Object.keys(firebaseUpdates),
+    stockPaths: Object.keys(firebaseUpdates).filter(k => k.includes('/stock/')),
+  });
+
+  await writeProductChildren(firebaseUpdates, auditEntry);
+  return refetchProductsFromFirebase('manual stock edit saved');
+}
+
+export async function addStockItemAndRefetch(branchId: string, date: string, item: Omit<StockItem, 'id'>): Promise<Branch[]> {
+  const branches = structuredClone(cachedBranches);
+  const branchIndex = getBranchIndex(branches, branchId);
+  const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
+  const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
+  if (!branch) return refetchProductsFromFirebase('receive production branch not found');
+  assertNonNegativeQuantity(item.quantity, 'stock item quantity');
+  const entryIndex = getDateEntryIndex(branch, date);
+  const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
+  if (!entry) return refetchProductsFromFirebase('receive production date entry not found');
+  const firebaseUpdates: Record<string, unknown> = {};
+  const beforeStock = entry.stock.map(stockItem => ({ ...stockItem }));
+  const existingIndex = entry.stock.findIndex(s => s.category === item.category && (s.shelfSize || '') === (item.shelfSize || '') && s.color === item.color);
+  if (existingIndex !== -1) {
+    entry.stock[existingIndex].quantity += item.quantity;
+    const firebaseStockIndex = getFirebaseStockIndex(branchId, date, entry.stock[existingIndex].id, existingIndex);
+    firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[existingIndex];
+  } else {
+    const stockIndex = getNextStockIndex(branchId, date, entry);
+    const newItem = { ...item, id: crypto.randomUUID() };
+    entry.stock.push(newItem);
+    firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', stockIndex)] = newItem;
+  }
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before stock receive recalculation');
+  recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
+  await writeProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'receive-production', 'stock item add/receive'));
+  return refetchProductsFromFirebase('receive production saved');
+}
+
+export async function addSaleAndRefetch(branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>): Promise<Branch[]> {
+  const branches = structuredClone(cachedBranches);
+  const branchIndex = getBranchIndex(branches, branchId);
+  const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
+  const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
+  if (!branch) return refetchProductsFromFirebase('add sale branch not found');
+  assertNonNegativeQuantity(sale.quantity, 'sale quantity');
+  const entryIndex = getDateEntryIndex(branch, date);
+  const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
+  if (!entry) return refetchProductsFromFirebase('add sale date entry not found');
+  const beforeStock = entry.stock.map(item => ({ ...item }));
+  const newSale: SalesEntry = {
+    ...sale,
+    id: crypto.randomUUID(),
+    branchId,
+    collection: sale.price - sale.driverCharge,
+  };
+  const saleIndex = getNextSaleIndex(branchId, date, entry);
+  entry.sales.push(newSale);
+  const stockIndex = getMatchingStockIndex(entry, sale.product, sale.color, sale.shelfSize || '');
+  const updates: Record<string, unknown> = {
+    [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'sales', saleIndex)]: newSale,
+  };
+  if (stockIndex !== -1) {
+    const firebaseStockIndex = getFirebaseStockIndex(branchId, date, entry.stock[stockIndex].id, stockIndex);
+    entry.stock[stockIndex].quantity = Math.max(0, entry.stock[stockIndex].quantity - sale.quantity);
+    updates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[stockIndex];
+  }
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before add sale recalculation');
+  recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, updates);
+  await writeProductChildren(updates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'add-sale', 'add sale'));
+  return refetchProductsFromFirebase('add sale saved');
+}
+
+export async function updateSaleAndRefetch(branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>): Promise<Branch[]> {
+  const branches = structuredClone(cachedBranches);
+  const branchIndex = getBranchIndex(branches, branchId);
+  const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
+  const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
+  if (!branch) return refetchProductsFromFirebase('edit sale branch not found');
+  const entryIndex = getDateEntryIndex(branch, date);
+  const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
+  if (!entry) return refetchProductsFromFirebase('edit sale date entry not found');
+  const saleIdx = entry.sales.findIndex(s => s.id === saleId);
+  if (saleIdx === -1) return refetchProductsFromFirebase('edit sale sale not found');
+  const beforeStock = entry.stock.map(item => ({ ...item }));
+  const oldSale = entry.sales[saleIdx];
+  const oldStockIndex = getMatchingStockIndex(entry, oldSale.product, oldSale.color, oldSale.shelfSize || '');
+  if (oldStockIndex !== -1) entry.stock[oldStockIndex].quantity += oldSale.quantity;
+  const updatedSale = { ...oldSale, ...updates };
+  assertNonNegativeQuantity(updatedSale.quantity, 'sale quantity');
+  updatedSale.collection = updatedSale.price - updatedSale.driverCharge;
+  entry.sales[saleIdx] = updatedSale;
+  const newStockIndex = getMatchingStockIndex(entry, updatedSale.product, updatedSale.color, updatedSale.shelfSize || '');
+  if (newStockIndex !== -1) entry.stock[newStockIndex].quantity = Math.max(0, entry.stock[newStockIndex].quantity - updatedSale.quantity);
+  const firebaseSaleIndex = getFirebaseSaleIndex(branchId, date, saleId, saleIdx);
+  const firebaseUpdates: Record<string, unknown> = {
+    [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'sales', firebaseSaleIndex)]: updatedSale,
+  };
+  if (oldStockIndex !== -1) {
+    const firebaseOldStockIndex = getFirebaseStockIndex(branchId, date, entry.stock[oldStockIndex].id, oldStockIndex);
+    firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseOldStockIndex)] = entry.stock[oldStockIndex];
+  }
+  if (newStockIndex !== -1) {
+    const firebaseNewStockIndex = getFirebaseStockIndex(branchId, date, entry.stock[newStockIndex].id, newStockIndex);
+    firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseNewStockIndex)] = entry.stock[newStockIndex];
+  }
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before edit sale recalculation');
+  recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
+  await writeProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'edit-sale', 'edit sale'));
+  return refetchProductsFromFirebase('edit sale saved');
+}
+
+export async function deleteSaleAndRefetch(branchId: string, date: string, saleId: string): Promise<Branch[]> {
+  const branches = structuredClone(cachedBranches);
+  const branchIndex = getBranchIndex(branches, branchId);
+  const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
+  const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
+  if (!branch) return refetchProductsFromFirebase('delete sale branch not found');
+  const entryIndex = getDateEntryIndex(branch, date);
+  const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
+  if (!entry) return refetchProductsFromFirebase('delete sale date entry not found');
+  const saleIndex = entry.sales.findIndex(s => s.id === saleId);
+  const sale = entry.sales[saleIndex];
+  if (!sale) return refetchProductsFromFirebase('delete sale sale not found');
+  const beforeStock = entry.stock.map(item => ({ ...item }));
+  const stockIndex = getMatchingStockIndex(entry, sale.product, sale.color, sale.shelfSize || '');
+  if (stockIndex !== -1) entry.stock[stockIndex].quantity += sale.quantity;
+  entry.sales = entry.sales.filter(s => s.id !== saleId);
+  const firebaseUpdates: Record<string, unknown> = {};
+  if (stockIndex !== -1) {
+    const firebaseStockIndex = getFirebaseStockIndex(branchId, date, entry.stock[stockIndex].id, stockIndex);
+    firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[stockIndex];
+  }
+  const firebaseSaleIndex = getFirebaseSaleIndex(branchId, date, saleId, saleIndex);
+  firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'sales', firebaseSaleIndex)] = {
+    ...sale,
+    deleted: true,
+    deletedAt: new Date().toISOString(),
+  };
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before delete sale recalculation');
+  recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
+  await writeProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'delete-sale', 'soft delete sale'));
+  return refetchProductsFromFirebase('delete sale saved');
 }
 
 export function acceptStoredStockAsCorrect(branchId: string, date: string): Branch[] {
@@ -1037,15 +1335,112 @@ export function externalTransfer(
   return branches;
 }
 
+export async function transferStockAndRefetch(
+  fromBranchId: string, toBranchId: string, date: string,
+  product: string, color: string, shelfSize: string, quantity: number
+): Promise<Branch[]> {
+  assertNonNegativeQuantity(quantity, 'transfer quantity');
+  const branches = structuredClone(cachedBranches);
+  const fromBranchIndex = getBranchIndex(branches, fromBranchId);
+  const firebaseFromBranchIndex = getFirebaseBranchIndex(branches, fromBranchId);
+  const fromBranch = branches[fromBranchIndex];
+  assertValidBranch(fromBranch, fromBranchId);
+  const fromEntryIndex = fromBranch ? getDateEntryIndex(fromBranch, date) : -1;
+  const firebaseFromEntryIndex = getFirebaseDateEntryIndex(fromBranchId, date, fromEntryIndex);
+  const fromEntry = fromBranch?.dateEntries[fromEntryIndex];
+  const fromStockIndex = fromEntry ? getMatchingStockIndex(fromEntry, product, color, shelfSize) : -1;
+  const fromItem = fromEntry && fromStockIndex !== -1 ? fromEntry.stock[fromStockIndex] : null;
+  if (!fromItem || fromItem.quantity < quantity) return refetchProductsFromFirebase('transfer stock source unavailable');
+  const toBranchIndex = getBranchIndex(branches, toBranchId);
+  const firebaseToBranchIndex = getFirebaseBranchIndex(branches, toBranchId);
+  const toBranch = branches[toBranchIndex];
+  assertValidBranch(toBranch, toBranchId);
+  if (!toBranch) return refetchProductsFromFirebase('transfer stock destination unavailable');
+  const fromBeforeStock = fromEntry.stock.map(item => ({ ...item }));
+  fromItem.quantity -= quantity;
+
+  let toEntryIndex = getDateEntryIndex(toBranch, date);
+  let toEntry = toBranch.dateEntries[toEntryIndex];
+  let firebaseToEntryIndex = getFirebaseDateEntryIndex(toBranchId, date, toEntryIndex);
+  if (!toEntry) {
+    toEntryIndex = toBranch.dateEntries.length;
+    firebaseToEntryIndex = getNextDateEntryIndex(toBranchId, toBranch);
+    toEntry = { date, stock: [], sales: [] };
+    toBranch.dateEntries.push(toEntry);
+  }
+  const toBeforeStock = toEntry.stock.map(item => ({ ...item }));
+  const toStockIndex = getMatchingStockIndex(toEntry, product, color, shelfSize);
+  const firebaseFromStockIndex = getFirebaseStockIndex(fromBranchId, date, fromItem.id, fromStockIndex);
+  const firebaseUpdates: Record<string, unknown> = {
+    [productPath(firebaseFromBranchIndex, 'dateEntries', firebaseFromEntryIndex, 'stock', firebaseFromStockIndex)]: fromItem,
+  };
+  if (toStockIndex !== -1) {
+    const firebaseToStockIndex = getFirebaseStockIndex(toBranchId, date, toEntry.stock[toStockIndex].id, toStockIndex);
+    toEntry.stock[toStockIndex].quantity += quantity;
+    firebaseUpdates[productPath(firebaseToBranchIndex, 'dateEntries', firebaseToEntryIndex, 'stock', firebaseToStockIndex)] = toEntry.stock[toStockIndex];
+  } else {
+    const newStockIndex = getNextStockIndex(toBranchId, date, toEntry);
+    const newStock = { id: crypto.randomUUID(), category: product, shelfSize, color, quantity };
+    toEntry.stock.push(newStock);
+    firebaseUpdates[productPath(firebaseToBranchIndex, 'dateEntries', firebaseToEntryIndex, 'stock', newStockIndex)] = newStock;
+    if (toEntry.stock.length === 1) {
+      firebaseUpdates[productPath(firebaseToBranchIndex, 'dateEntries', firebaseToEntryIndex, 'date')] = toEntry.date;
+      firebaseUpdates[productPath(firebaseToBranchIndex, 'dateEntries', firebaseToEntryIndex, 'sales')] = toEntry.sales;
+    }
+  }
+  backupBranchBeforeRecalculation(firebaseFromBranchIndex, fromBranch, 'before outgoing transfer recalculation');
+  backupBranchBeforeRecalculation(firebaseToBranchIndex, toBranch, 'before incoming transfer recalculation');
+  recalculateFutureDateEntries(branches, fromBranch, fromBranchId, date, fromEntry.stock, firebaseUpdates);
+  recalculateFutureDateEntries(branches, toBranch, toBranchId, date, toEntry.stock, firebaseUpdates);
+  await writeProductChildren(firebaseUpdates, {
+    reason: 'transfer stock',
+    branch: `${fromBranch.name} -> ${toBranch.name}`,
+    date,
+    oldStock: stockAuditSnapshot([...fromBeforeStock, ...toBeforeStock]),
+    newStock: stockAuditSnapshot([...fromEntry.stock, ...toEntry.stock]),
+    approvedStockAction: true,
+    stockChangeReason: 'transfer-stock',
+  });
+  return refetchProductsFromFirebase('transfer stock saved');
+}
+
+export async function externalTransferAndRefetch(
+  branchId: string, date: string,
+  product: string, color: string, shelfSize: string, quantity: number
+): Promise<Branch[]> {
+  assertNonNegativeQuantity(quantity, 'external transfer quantity');
+  const branches = structuredClone(cachedBranches);
+  const branchIndex = getBranchIndex(branches, branchId);
+  const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
+  const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
+  const entryIndex = branch ? getDateEntryIndex(branch, date) : -1;
+  const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  const entry = branch?.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
+  const stockIndex = entry ? getMatchingStockIndex(entry, product, color, shelfSize) : -1;
+  const item = entry && stockIndex !== -1 ? entry.stock[stockIndex] : null;
+  if (!item || item.quantity < quantity) return refetchProductsFromFirebase('external transfer source unavailable');
+  const beforeStock = entry.stock.map(stockItem => ({ ...stockItem }));
+  item.quantity -= quantity;
+  const firebaseUpdates: Record<string, unknown> = {
+    [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', getFirebaseStockIndex(branchId, date, item.id, stockIndex))]: item,
+  };
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before external transfer recalculation');
+  recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
+  await writeProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'external-transfer', 'external transfer'));
+  return refetchProductsFromFirebase('external transfer saved');
+}
+
 // History logging
 export function logProductionReceive(record: Omit<ProductionRecord, 'id'>) {
   const newRef = push(ref(db, PRODUCTION_HISTORY_PATH));
-  safeSetPath(`${PRODUCTION_HISTORY_PATH}/${newRef.key}`, { ...record, id: newRef.key }, { action: 'set', entity: 'production-history' });
+  return safeSetPath(`${PRODUCTION_HISTORY_PATH}/${newRef.key}`, { ...record, id: newRef.key }, { action: 'set', entity: 'production-history' });
 }
 
 export function logTransfer(record: Omit<TransferRecord, 'id'>) {
   const newRef = push(ref(db, TRANSFER_HISTORY_PATH));
-  safeSetPath(`${TRANSFER_HISTORY_PATH}/${newRef.key}`, { ...record, id: newRef.key }, { action: 'set', entity: 'transfer-history' });
+  return safeSetPath(`${TRANSFER_HISTORY_PATH}/${newRef.key}`, { ...record, id: newRef.key }, { action: 'set', entity: 'transfer-history' });
 }
 
 export function updateTransferRecord(id: string, updates: Partial<TransferRecord>) {

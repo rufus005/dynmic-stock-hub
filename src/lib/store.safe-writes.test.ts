@@ -4,6 +4,7 @@ import type { Branch } from './types';
 const firebaseCalls = vi.hoisted(() => ({
   set: vi.fn(() => Promise.resolve()),
   update: vi.fn(() => Promise.resolve()),
+  get: vi.fn(() => Promise.resolve({ val: () => null })),
   remove: vi.fn(() => Promise.resolve()),
   push: vi.fn(() => ({ path: 'mock-push-path', key: 'mock-push-key' })),
   ref: vi.fn((_db: unknown, path?: string) => ({ path: path || '' })),
@@ -18,6 +19,7 @@ vi.mock('firebase/database', () => ({
   ref: firebaseCalls.ref,
   set: firebaseCalls.set,
   update: firebaseCalls.update,
+  get: firebaseCalls.get,
   remove: firebaseCalls.remove,
   push: firebaseCalls.push,
 }));
@@ -450,12 +452,16 @@ describe('store Firebase product writes', () => {
     await flushFirebaseQueue();
     const updateCalls = firebaseCalls.update.mock.calls.map(([, updates]) => updates as Record<string, unknown>);
     const updateKeys = updateCalls.flatMap(updates => Object.keys(updates));
-    expect(updateKeys).toContain('products/0/dateEntries/1');
+    // Should have exact child paths for stock and metadata
+    expect(updateKeys).toContain('products/0/dateEntries/1/stock/0');
+    expect(updateKeys).toContain('products/0/dateEntries/1/manualStockEditedAt');
+    expect(updateKeys).toContain('products/0/dateEntries/1/manualStockEditReason');
+    // May have future date entry recalculation
     expect(updateKeys).toContain('products/0/dateEntries/2');
     expect(updateKeys).not.toContain('products');
     expect(updateCalls.some(updates => {
-      const entry = updates['products/0/dateEntries/1'] as { manualStockEditReason?: string } | undefined;
-      return entry?.manualStockEditReason === 'manual-stock-edit';
+      const metadataReason = updates['products/0/dateEntries/1/manualStockEditReason'];
+      return metadataReason === 'manual-stock-edit';
     })).toBe(true);
 
     const auditRows = store.getStockAuditRows(branches[0]);
@@ -567,5 +573,358 @@ describe('store Firebase product writes', () => {
     branches = store.transferStock('branch-1', 'branch-2', '2026-06-04', 'JUMBO', 'Ivory', '5', 10);
     expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-05')!.stock[0].quantity).toBe(295);
     expect(branches[1].dateEntries.find(entry => entry.date === '2026-06-05')!.stock[0].quantity).toBe(10);
+  });
+
+  it('saves manual stock edits with exact child paths and persists metadata across refetch', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    let branches = store.initCache([
+      {
+        id: 'branch-1',
+        name: 'Test Branch',
+        dateEntries: [
+          {
+            date: '2026-06-05',
+            stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 100 }],
+            sales: [],
+          },
+        ],
+      },
+    ]);
+    vi.clearAllMocks();
+
+    // Simulate admin manual stock edit
+    const newStock = [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 150 }];
+    branches = store.updateDateStock('branch-1', '2026-06-05', newStock);
+
+    const updatedEntry = branches[0].dateEntries[0];
+    expect(updatedEntry.stock[0].quantity).toBe(150);
+    expect(updatedEntry.manualStockEditedAt).toBeDefined();
+    expect(updatedEntry.manualStockEditReason).toBe('manual-stock-edit');
+
+    await flushFirebaseQueue();
+
+    // Verify exact child paths were written
+    const updateCalls = firebaseCalls.update.mock.calls.map(([, updates]) => updates as Record<string, unknown>);
+    const updateKeys = updateCalls.flatMap(updates => Object.keys(updates));
+
+    // Should include stock child path
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    // Should include metadata paths
+    expect(updateKeys).toContain('products/0/dateEntries/0/manualStockEditedAt');
+    expect(updateKeys).toContain('products/0/dateEntries/0/manualStockEditReason');
+    // Should NOT include full entry path or products root
+    expect(updateKeys.filter(k => k === 'products/0/dateEntries/0' || k === 'products')).toHaveLength(0);
+
+    // Simulate Firebase refetch with persisted data
+    const refetchedBranches = store.updateCache([
+      {
+        id: 'branch-1',
+        name: 'Test Branch',
+        dateEntries: [
+          {
+            date: '2026-06-05',
+            stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 150 }],
+            sales: [],
+            manualStockEditedAt: updatedEntry.manualStockEditedAt,
+            manualStockEditReason: 'manual-stock-edit',
+          },
+        ],
+      },
+    ]);
+
+    // Verify persisted data is correctly loaded
+    const refetchedEntry = refetchedBranches[0].dateEntries[0];
+    expect(refetchedEntry.stock[0].quantity).toBe(150);
+    expect(refetchedEntry.manualStockEditedAt).toBe(updatedEntry.manualStockEditedAt);
+    expect(refetchedEntry.manualStockEditReason).toBe('manual-stock-edit');
+  });
+
+  it('awaits manual stock Firebase write and returns only the refetched products snapshot', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache([
+      {
+        id: 'branch-1',
+        name: 'Test Branch',
+        dateEntries: [
+          {
+            date: '2026-06-05',
+            stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 100 }],
+            sales: [],
+          },
+        ],
+      },
+    ]);
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Test Branch',
+          dateEntries: [
+            {
+              date: '2026-06-05',
+              stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 150 }],
+              sales: [],
+              manualStockEditedAt: '2026-06-10T12:00:00.000Z',
+              manualStockEditReason: 'manual-stock-edit',
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.updateDateStockAndRefetch('branch-1', '2026-06-05', [
+      { id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 150 },
+    ]);
+
+    expect(firebaseCalls.update).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '' }),
+      expect.objectContaining({
+        'products/0/dateEntries/0/stock/0': expect.objectContaining({ quantity: 150 }),
+        'products/0/dateEntries/0/manualStockEditReason': 'manual-stock-edit',
+      })
+    );
+    expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(150);
+    expect(store.getBranches()[0].dateEntries[0].stock[0].quantity).toBe(150);
+  });
+
+  it('awaits add sale write and returns only the refetched products snapshot', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache(initialBranches());
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Branch One',
+          dateEntries: [
+            {
+              date: '2026-06-01',
+              stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 9 }],
+              sales: [{ id: 'sale-1', date: '2026-06-01', customerNumber: 'C-1', driverName: 'Driver', product: 'JUMBO', color: 'Ivory', shelfSize: '5', quantity: 1, price: 100, driverCharge: 10, collection: 90, branchId: 'branch-1' }],
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.addSaleAndRefetch('branch-1', '2026-06-01', {
+      date: '2026-06-01',
+      customerNumber: 'C-1',
+      driverName: 'Driver',
+      product: 'JUMBO',
+      color: 'Ivory',
+      shelfSize: '5',
+      quantity: 1,
+      price: 100,
+      driverCharge: 10,
+    });
+
+    const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/0/sales/0');
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    expect(updateKeys).not.toContain('products');
+    expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(9);
+  });
+
+  it('awaits edit sale write and returns only the refetched products snapshot', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache([
+      {
+        id: 'branch-1',
+        name: 'Branch One',
+        dateEntries: [
+          {
+            date: '2026-06-01',
+            stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 9 }],
+            sales: [{ id: 'sale-1', date: '2026-06-01', customerNumber: 'C-1', driverName: 'Driver', product: 'JUMBO', color: 'Ivory', shelfSize: '5', quantity: 1, price: 100, driverCharge: 10, collection: 90, branchId: 'branch-1' }],
+          },
+        ],
+      },
+    ]);
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Branch One',
+          dateEntries: [
+            {
+              date: '2026-06-01',
+              stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 7 }],
+              sales: [{ id: 'sale-1', date: '2026-06-01', customerNumber: 'C-1', driverName: 'Driver', product: 'JUMBO', color: 'Ivory', shelfSize: '5', quantity: 3, price: 300, driverCharge: 10, collection: 290, branchId: 'branch-1' }],
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.updateSaleAndRefetch('branch-1', '2026-06-01', 'sale-1', { quantity: 3, price: 300 });
+
+    const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/0/sales/0');
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    expect(updateKeys).not.toContain('products');
+    expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(7);
+  });
+
+  it('awaits delete sale soft-write and returns only the refetched products snapshot', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache([
+      {
+        id: 'branch-1',
+        name: 'Branch One',
+        dateEntries: [
+          {
+            date: '2026-06-01',
+            stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 9 }],
+            sales: [{ id: 'sale-1', date: '2026-06-01', customerNumber: 'C-1', driverName: 'Driver', product: 'JUMBO', color: 'Ivory', shelfSize: '5', quantity: 1, price: 100, driverCharge: 10, collection: 90, branchId: 'branch-1' }],
+          },
+        ],
+      },
+    ]);
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Branch One',
+          dateEntries: [
+            {
+              date: '2026-06-01',
+              stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 10 }],
+              sales: [{ id: 'sale-1', deleted: true }],
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.deleteSaleAndRefetch('branch-1', '2026-06-01', 'sale-1');
+
+    const updateCalls = firebaseCalls.update.mock.calls.map(([, updates]) => updates as Record<string, unknown>);
+    const updateKeys = updateCalls.flatMap(updates => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/0/sales/0');
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    expect(updateKeys).not.toContain('products');
+    expect(updateCalls.some(updates => (updates['products/0/dateEntries/0/sales/0'] as { deleted?: boolean })?.deleted === true)).toBe(true);
+    expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(10);
+  });
+
+  it('awaits receive production write and returns only the refetched products snapshot', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache(initialBranches());
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Branch One',
+          dateEntries: [
+            {
+              date: '2026-06-01',
+              stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 15 }],
+              sales: [],
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.addStockItemAndRefetch('branch-1', '2026-06-01', {
+      category: 'JUMBO',
+      shelfSize: '5',
+      color: 'Ivory',
+      quantity: 5,
+    });
+
+    const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    expect(updateKeys).not.toContain('products');
+    expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(15);
+  });
+
+  it('awaits transfer stock write and returns only the refetched products snapshot', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache(initialBranches());
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Branch One',
+          dateEntries: [
+            {
+              date: '2026-06-01',
+              stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 8 }],
+              sales: [],
+            },
+          ],
+        },
+        {
+          id: 'branch-2',
+          name: 'Branch Two',
+          dateEntries: [
+            {
+              date: '2026-06-01',
+              stock: [{ id: 'stock-2', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 101 }],
+              sales: [],
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.transferStockAndRefetch('branch-1', 'branch-2', '2026-06-01', 'JUMBO', 'Ivory', '5', 2);
+
+    const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    expect(updateKeys).toContain('products/1/dateEntries/0/stock/0');
+    expect(updateKeys).not.toContain('products');
+    expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(8);
+    expect(branches[1].dateEntries[0].stock[0].quantity).toBe(101);
+  });
+
+  it('awaits external transfer write and returns only the refetched products snapshot', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache(initialBranches());
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Branch One',
+          dateEntries: [
+            {
+              date: '2026-06-01',
+              stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 6 }],
+              sales: [],
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.externalTransferAndRefetch('branch-1', '2026-06-01', 'JUMBO', 'Ivory', '5', 4);
+
+    const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    expect(updateKeys).not.toContain('products');
+    expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(6);
   });
 });

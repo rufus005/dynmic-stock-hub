@@ -1,7 +1,7 @@
 import { initializeApp } from "firebase/app";
 import { getDatabase } from "firebase/database";
 
-const firebaseConfig = {
+export const firebaseConfig = {
   apiKey: "AIzaSyAQ-zVncSRduqQirjv1CikE5_KqwWHncBc",
   authDomain: "planning-with-ai-8bca4.firebaseapp.com",
   databaseURL: "https://planning-with-ai-8bca4-default-rtdb.asia-southeast1.firebasedatabase.app",
