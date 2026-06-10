@@ -3,7 +3,7 @@ import { useParams, useNavigate, Navigate } from 'react-router-dom';
 import { useData } from '@/contexts/DataContext';
 import { useAuth } from '@/contexts/AuthContext';
 import { StockItem, SalesEntry, DynamicCategory } from '@/lib/types';
-import { getRecalculatedDateEntries } from '@/lib/store';
+import { getRecalculatedDateEntries, getStockAuditRows, type StockAuditResult } from '@/lib/store';
 import { motion } from 'framer-motion';
 import { ArrowLeft, Save, Plus, Trash2, Pencil, Check, X, Calendar, ChevronRight, ChevronDown, Tag } from 'lucide-react';
 import AppLayout from '@/components/AppLayout';
@@ -147,6 +147,17 @@ export default function BranchPage() {
 
     if (existingEntryFound) {
       autoCreatedDatesRef.current.delete(autoCreateKey);
+      return;
+    }
+
+    const hasPreviousClosingStock = branch.dateEntries.some(entry => entry.date < todaysDate);
+    if (!hasPreviousClosingStock) {
+      console.warn('[Auto daily date entry blocked]', {
+        todaysDate,
+        branchId: branch.id,
+        branchName: branch.name,
+        reason: 'No previous closing stock exists to carry forward',
+      });
       return;
     }
 
@@ -348,6 +359,7 @@ function DateDetailView({
 }) {
   const { productionHistory, transferHistory, availableTags, updateTransferRecord, deleteTransferRecord, updateProductionRecord, deleteProductionRecord } = useData();
   const [localStock, setLocalStock] = useState<StockItem[]>(dateEntry.stock);
+  const [stockAuditRows, setStockAuditRows] = useState<StockAuditResult[] | null>(null);
 
   // Build a category map for lookups
   const categoryMap = useMemo(() => {
@@ -359,6 +371,11 @@ function DateDetailView({
   }, [categories]);
 
   const categoryNames = useMemo(() => categories.map(c => c.name), [categories]);
+
+  useEffect(() => {
+    setLocalStock(dateEntry.stock);
+    setStockAuditRows(null);
+  }, [dateEntry.date, dateEntry.stock]);
 
   useEffect(() => {
     setLocalStock(prev => {
@@ -493,6 +510,29 @@ function DateDetailView({
     toast.success('Stock saved');
   };
 
+  const runStockAudit = () => {
+    const branch = branches.find(item => item.id === branchId);
+    if (!branch) {
+      toast.error('Branch not found');
+      return;
+    }
+    const rows = getStockAuditRows(branch);
+    const mismatches = rows.filter(row => row.status === 'mismatch');
+    setStockAuditRows(rows);
+    console.log('[Stock audit read-only result]', {
+      branchId,
+      branchName,
+      date: dateEntry.date,
+      mismatchCount: mismatches.length,
+      rows,
+    });
+    if (mismatches.length > 0) {
+      toast.warning(`Stock audit found ${mismatches.length} mismatch date(s)`);
+    } else {
+      toast.success('Stock audit passed');
+    }
+  };
+
   const handleAddShelfSizeRow = (catName: string, colors: string[]) => {
     const newSize = prompt('Enter new shelf size (e.g. 1, 6, etc.):');
     if (!newSize || !newSize.trim()) return;
@@ -624,12 +664,39 @@ function DateDetailView({
       <div className="glass-card rounded-xl p-5">
         <div className="flex items-center justify-between mb-4">
           <h2 className="font-semibold text-lg">Stock Management</h2>
-          {userRole === 'admin' && (
-            <button onClick={saveStock} className="flex items-center gap-1.5 px-4 py-2 rounded-lg gradient-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity">
-              <Save className="w-4 h-4" /> Save Stock
+          <div className="flex items-center gap-2">
+            <button onClick={runStockAudit} className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-muted text-foreground text-sm font-medium hover:bg-muted/80 transition-colors">
+              <Check className="w-4 h-4" /> Stock Audit
             </button>
-          )}
+            {userRole === 'admin' && (
+              <button onClick={saveStock} className="flex items-center gap-1.5 px-4 py-2 rounded-lg gradient-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity">
+                <Save className="w-4 h-4" /> Save Stock
+              </button>
+            )}
+          </div>
         </div>
+
+        {stockAuditRows && (
+          <div className="mb-4 rounded-lg border border-border bg-muted/30 p-3 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span className="font-medium">Stock Audit</span>
+              <span className="text-muted-foreground">
+                {stockAuditRows.filter(row => row.status === 'mismatch').length} mismatch
+              </span>
+            </div>
+            <div className="mt-2 space-y-1">
+              {stockAuditRows.filter(row => row.status === 'mismatch').slice(0, 6).map(row => (
+                <div key={row.date} className="flex items-center justify-between gap-3 text-xs">
+                  <span>{formatEntryDate(row.date)}</span>
+                  <span className="font-mono">Expected {row.expectedStock} / Stored {row.storedStock}</span>
+                </div>
+              ))}
+              {stockAuditRows.some(row => row.status === 'mismatch') === false && (
+                <p className="text-xs text-muted-foreground">Stored stock matches expected stock. Manual stock edit dates are treated as source of truth.</p>
+              )}
+            </div>
+          </div>
+        )}
 
         {categories.map(cat => {
           const catItems = localStock.filter(s => s.category === cat.name);

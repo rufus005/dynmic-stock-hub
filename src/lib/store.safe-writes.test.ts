@@ -82,6 +82,57 @@ describe('store Firebase product writes', () => {
     expect(firebaseCalls.remove).not.toHaveBeenCalled();
   });
 
+  it('blocks unapproved product stock writes and audits approved stock actions', async () => {
+    const protection = await import('./firebaseProtection');
+    const oldStock = {
+      total: 10,
+      rows: [{ category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 10 }],
+    };
+    const newStock = {
+      total: 9,
+      rows: [{ category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 9 }],
+    };
+
+    await expect(protection.safeSetPath(
+      'products/0/dateEntries/0/stock/0',
+      { id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 9 },
+      { action: 'set', entity: 'products-child', reason: 'page load' }
+    )).rejects.toThrow('Blocked unapproved automatic stock write');
+    expect(firebaseCalls.set).not.toHaveBeenCalled();
+
+    await protection.safeSetPath(
+      'products/0/dateEntries/0/stock/0',
+      { id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 9 },
+      {
+        action: 'set',
+        entity: 'products-child',
+        reason: 'add sale',
+        branch: 'Branch One',
+        date: '2026-06-01',
+        oldStock,
+        newStock,
+        approvedStockAction: true,
+        stockChangeReason: 'add-sale',
+      }
+    );
+
+    expect(firebaseCalls.set).toHaveBeenCalledWith(
+      expect.objectContaining({ path: 'products/0/dateEntries/0/stock/0' }),
+      expect.objectContaining({ quantity: 9 })
+    );
+    expect(firebaseCalls.set).toHaveBeenCalledWith(
+      expect.objectContaining({ path: 'mock-push-path' }),
+      expect.objectContaining({
+        action: 'set',
+        branch: 'Branch One',
+        date: '2026-06-01',
+        oldStock,
+        newStock,
+        stockChangeReason: 'add-sale',
+      })
+    );
+  });
+
   it('writes sales, stock, dates, and transfers only to exact products child paths', async () => {
     const store = await import('./store');
     let branches = store.initCache(initialBranches());
@@ -299,6 +350,64 @@ describe('store Firebase product writes', () => {
     branches = store.deleteSale('branch-1', '2026-06-04', saleId);
     expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-04')!.stock[0].quantity).toBe(295);
     expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-05')!.stock[0].quantity).toBe(294);
+  });
+
+  it('preserves manual stock edits as source of truth during older-date recalculation', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    let branches = store.initCache([
+      {
+        id: 'branch-1',
+        name: 'Branch One',
+        dateEntries: [
+          {
+            date: '2026-06-04',
+            stock: [{ id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 100 }],
+            sales: [],
+          },
+          {
+            date: '2026-06-05',
+            stock: [{ id: 'stock-2', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 500 }],
+            sales: [],
+            manualStockEditedAt: '2026-06-05T08:00:00.000Z',
+            manualStockEditReason: 'manual stock edit',
+          },
+          {
+            date: '2026-06-06',
+            stock: [{ id: 'stock-3', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 499 }],
+            sales: [{ id: 'sale-2', date: '2026-06-06', customerNumber: 'C-2', driverName: 'Driver', product: 'JUMBO', color: 'Ivory', shelfSize: '5', quantity: 1, price: 100, driverCharge: 10, collection: 90, branchId: 'branch-1' }],
+          },
+        ],
+      },
+    ]);
+    vi.clearAllMocks();
+
+    branches = store.addSale('branch-1', '2026-06-04', {
+      date: '2026-06-04',
+      customerNumber: 'C-1',
+      driverName: 'Driver',
+      product: 'JUMBO',
+      color: 'Ivory',
+      shelfSize: '5',
+      quantity: 10,
+      price: 100,
+      driverCharge: 10,
+    });
+
+    expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-04')!.stock[0].quantity).toBe(90);
+    expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-05')!.stock[0].quantity).toBe(500);
+    expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-06')!.stock[0].quantity).toBe(499);
+
+    await flushFirebaseQueue();
+    const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/0/sales/0');
+    expect(updateKeys).toContain('products/0/dateEntries/0/stock/0');
+    expect(updateKeys).not.toContain('products/0/dateEntries/1');
+    expect(updateKeys).toContain('products/0/dateEntries/2');
+
+    const auditRows = store.getStockAuditRows(branches[0]);
+    expect(auditRows.find(row => row.date === '2026-06-05')?.status).toBe('manual-base');
+    expect(auditRows.find(row => row.date === '2026-06-06')?.status).toBe('ok');
   });
 
   it('recalculates future stock for stock edits, production receives, and transfers', async () => {

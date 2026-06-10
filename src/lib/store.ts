@@ -181,26 +181,29 @@ function rememberNextSaleIndex(branchId: string, date: string, saleIndex: number
   nextSaleIndexByBranchDate.set(key, Math.max(nextSaleIndexByBranchDate.get(key) ?? 0, saleIndex));
 }
 
-function writeProductChild(pathSegments: (string | number)[], value: unknown) {
+function writeProductChild(pathSegments: (string | number)[], value: unknown, options?: Parameters<typeof safeSetPath>[2]) {
   const path = productPath(...pathSegments);
   console.log('[Firebase child write]', { path });
-  safeSetPath(path, value, { action: 'set', entity: 'products-child' })
+  safeSetPath(path, value, { action: 'set', entity: 'products-child', ...options })
     .then(() => console.log('[Firebase child write result]', { path, result: 'success' }))
     .catch(err => console.error('[Firebase child write result]', { path, result: 'error', error: err }));
 }
 
-function updateProductChildren(updates: Record<string, unknown>, reason = 'products child update') {
+function updateProductChildren(updates: Record<string, unknown>, options: Parameters<typeof safeUpdatePaths>[1] | string = 'products child update') {
   const backups = pendingBackupPromises;
   pendingBackupPromises = [];
   const backupBarrier = backups.length > 0 ? Promise.all(backups).then(() => undefined) : Promise.resolve();
+  const writeOptions = typeof options === 'string'
+    ? { action: 'update' as const, entity: 'products-child', reason: options }
+    : { action: 'update' as const, entity: 'products-child', ...options };
   backupBarrier
-    .then(() => safeUpdatePaths(updates, { action: 'update', entity: 'products-child', reason }))
+    .then(() => safeUpdatePaths(updates, writeOptions))
     .catch(err => console.error('Firebase backup/write failed:', err));
 }
 
-function softDeleteProductChild(pathSegments: (string | number)[], reason = 'products child soft delete') {
+function softDeleteProductChild(pathSegments: (string | number)[], reason = 'products child soft delete', options?: Omit<Parameters<typeof safeSoftDeletePath>[1], 'entity' | 'reason'>) {
   const path = productPath(...pathSegments);
-  safeSoftDeletePath(path, { entity: 'products-child', reason })
+  safeSoftDeletePath(path, { entity: 'products-child', reason, ...options })
     .catch(err => console.error('Firebase soft delete failed:', err));
 }
 
@@ -242,6 +245,10 @@ function cloneClosingStockWithSalesApplied(openingStock: StockItem[], entry: Dat
   return closingStock;
 }
 
+function isManualStockAnchor(entry: DateEntry): boolean {
+  return Boolean(entry.manualStockEditedAt);
+}
+
 function stockQuantityByKey(stock: StockItem[], key: string): number {
   return stockMap(stock).get(key)?.quantity || 0;
 }
@@ -254,6 +261,15 @@ function totalSalesQuantity(entry: DateEntry): number {
   return entry.sales.reduce((sum, sale) => sum + sale.quantity, 0);
 }
 
+function stockMismatchCount(left: StockItem[], right: StockItem[]): number {
+  const keys = new Set([...left.map(stockKey), ...right.map(stockKey)]);
+  let mismatches = 0;
+  keys.forEach(key => {
+    if (stockQuantityByKey(left, key) !== stockQuantityByKey(right, key)) mismatches += 1;
+  });
+  return mismatches;
+}
+
 function nonZeroStockRows(stock: StockItem[]) {
   return stock
     .filter(item => item.quantity > 0)
@@ -263,6 +279,53 @@ function nonZeroStockRows(stock: StockItem[]) {
       color: item.color,
       quantity: item.quantity,
     }));
+}
+
+function stockAuditSnapshot(stock: StockItem[]) {
+  const rows = stock
+    .map(item => ({
+      category: item.category,
+      shelfSize: item.shelfSize || '',
+      color: item.color,
+      quantity: item.quantity,
+    }))
+    .sort((a, b) => `${a.category}|${a.shelfSize}|${a.color}`.localeCompare(`${b.category}|${b.shelfSize}|${b.color}`));
+  return {
+    total: rows.reduce((sum, item) => sum + item.quantity, 0),
+    rows,
+  };
+}
+
+function sameStockSnapshot(left: StockItem[], right: StockItem[]) {
+  const leftSnapshot = stockAuditSnapshot(left);
+  const rightSnapshot = stockAuditSnapshot(right);
+  if (leftSnapshot.total !== rightSnapshot.total || leftSnapshot.rows.length !== rightSnapshot.rows.length) return false;
+  return leftSnapshot.rows.every((item, index) => {
+    const other = rightSnapshot.rows[index];
+    return item.category === other.category
+      && item.shelfSize === other.shelfSize
+      && item.color === other.color
+      && item.quantity === other.quantity;
+  });
+}
+
+function stockWriteAudit(
+  branch: Branch,
+  date: string,
+  oldStock: StockItem[],
+  newStock: StockItem[],
+  stockChangeReason: string,
+  reason = stockChangeReason
+) {
+  return {
+    reason,
+    branch: branch.name,
+    date,
+    oldStock: stockAuditSnapshot(oldStock),
+    newStock: stockAuditSnapshot(newStock),
+    approvedStockAction: true,
+    stockChangeReason,
+  };
 }
 
 function recalculateFutureDateEntries(
@@ -283,6 +346,17 @@ function recalculateFutureDateEntries(
 
   for (let i = changedIndex + 1; i < branch.dateEntries.length; i++) {
     const entry = branch.dateEntries[i];
+    if (isManualStockAnchor(entry)) {
+      previousClosingStock = entry.stock.map(item => ({ ...item }));
+      console.warn('[Stock recalculation preserved manual stock]', {
+        branchId,
+        date: entry.date,
+        manualStockEditedAt: entry.manualStockEditedAt,
+        preservedStock: totalStockQuantity(entry.stock),
+        reason: 'manual stock edit is source of truth',
+      });
+      continue;
+    }
     const openingStock = previousClosingStock.map(item => ({ ...item }));
     const previousSnapshot = entry.stock.map(item => ({ ...item }));
     const closingStock = cloneClosingStockWithSalesApplied(openingStock, entry);
@@ -403,6 +477,8 @@ function sanitizeBranches(data: unknown): Branch[] {
         date: d.date || '',
         stock,
         sales,
+        manualStockEditedAt: typeof d.manualStockEditedAt === 'string' ? d.manualStockEditedAt : undefined,
+        manualStockEditReason: typeof d.manualStockEditReason === 'string' ? d.manualStockEditReason : undefined,
       };
     }).filter(Boolean) as DateEntry[] : [];
     for (const entry of dateEntries) {
@@ -422,11 +498,10 @@ export function initCache(data: unknown): Branch[] {
     const migrated = migrateFromLocalStorage();
     if (migrated) {
       cachedBranches = migrated;
-      updateProductChildren(migrated.reduce((acc, branch, index) => {
-        acc[productPath(index)] = branch;
-        return acc;
-      }, {} as Record<string, Branch>));
-      localStorage.removeItem(STORAGE_KEY);
+      console.warn('[Blocked automatic stock write]', {
+        reason: 'localStorage migration is read-only until manually reviewed',
+        affectedBranches: migrated.map(branch => branch.name),
+      });
       initialized = true;
       return migrated;
     }
@@ -465,7 +540,12 @@ export function updateBranch(id: string, updates: Partial<Branch>): Branch[] {
   const idx = branches.findIndex(b => b.id === id);
   if (idx !== -1) {
     branches[idx] = { ...branches[idx], ...updates };
-    writeProductChild([getFirebaseBranchIndex(branches, id)], branches[idx]);
+    const firebaseBranchIndex = getFirebaseBranchIndex(branches, id);
+    const childUpdates = Object.entries(updates).reduce((acc, [key, value]) => {
+      acc[productPath(firebaseBranchIndex, key)] = value;
+      return acc;
+    }, {} as Record<string, unknown>);
+    updateProductChildren(childUpdates, 'branch update');
   }
   cachedBranches = branches;
   return branches;
@@ -501,9 +581,26 @@ export function addDateEntry(branchId: string, date: string, options?: { source?
     .filter(d => d.date < date)
     .sort((a, b) => b.date.localeCompare(a.date));
   const previousEntry = previousEntries[0];
+  if (options?.source === 'auto' && !previousEntry) {
+    console.warn('[Blocked automatic date entry]', {
+      selectedDate: date,
+      branchId,
+      reason: 'No previous closing stock exists to carry forward',
+    });
+    return branches;
+  }
   const newStock = deduplicateStock(previousEntry
     ? structuredClone(previousEntry.stock)
     : createDefaultStock());
+  if (options?.source === 'auto' && previousEntry && !sameStockSnapshot(previousEntry.stock, newStock)) {
+    console.warn('[Blocked automatic date entry]', {
+      selectedDate: date,
+      branchId,
+      openingStockDate: previousEntry.date,
+      reason: 'Automatic carry-forward stock did not match previous closing stock exactly',
+    });
+    return branches;
+  }
   const entryIndex = getNextDateEntryIndex(branchId, branch);
   const newEntry = { date, stock: newStock, sales: [] };
   branch.dateEntries.push(newEntry);
@@ -529,7 +626,18 @@ export function addDateEntry(branchId: string, date: string, options?: { source?
       autoCreatedPath: firebaseWritePath,
     });
   }
-  writeProductChild([firebaseBranchIndex, 'dateEntries', entryIndex], newEntry);
+  writeProductChild(
+    [firebaseBranchIndex, 'dateEntries', entryIndex],
+    newEntry,
+    stockWriteAudit(
+      branch,
+      date,
+      previousEntry?.stock || [],
+      newStock,
+      options?.source === 'auto' ? 'auto-date-carry-forward' : 'manual-date-create',
+      options?.source === 'auto' ? 'auto date carry-forward' : 'manual date create'
+    )
+  );
   cachedBranches = branches;
   return branches;
 }
@@ -543,10 +651,17 @@ export function deleteDateEntry(branchId: string, date: string): Branch[] {
   if (!branch) return branches;
   const entryIndex = getDateEntryIndex(branch, date);
   const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
-  assertValidDateEntry(branch.dateEntries[entryIndex], date);
+  const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
   branch.dateEntries = branch.dateEntries.filter(d => d.date !== date);
   cachedBranches = branches;
-  if (entryIndex !== -1) softDeleteProductChild([firebaseBranchIndex, 'dateEntries', firebaseEntryIndex], 'date entry soft delete');
+  if (entryIndex !== -1) {
+    softDeleteProductChild(
+      [firebaseBranchIndex, 'dateEntries', firebaseEntryIndex],
+      'date entry soft delete',
+      stockWriteAudit(branch, date, entry.stock, [], 'manual-stock-edit', 'date entry soft delete')
+    );
+  }
   return branches;
 }
 
@@ -564,16 +679,21 @@ export function updateStockItem(branchId: string, date: string, stockId: string,
   if (!entry) return branches;
   const idx = getStockIndex(entry, stockId);
   const firebaseUpdates: Record<string, unknown> = {};
+  const beforeStock = entry.stock.map(item => ({ ...item }));
   if (idx !== -1) {
     entry.stock[idx] = { ...entry.stock[idx], ...updates };
+    entry.manualStockEditedAt = new Date().toISOString();
+    entry.manualStockEditReason = 'manual stock item update';
     assertNonNegativeQuantity(entry.stock[idx].quantity, 'stock quantity');
     const firebaseStockIndex = getFirebaseStockIndex(branchId, date, stockId, idx);
     firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[idx];
+    firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'manualStockEditedAt')] = entry.manualStockEditedAt;
+    firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'manualStockEditReason')] = entry.manualStockEditReason;
     backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before stock item recalculation');
     recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   }
   cachedBranches = branches;
-  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates, 'stock item update');
+  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'stock item update'));
   return branches;
 }
 
@@ -591,6 +711,7 @@ export function addStockItem(branchId: string, date: string, item: Omit<StockIte
   assertValidDateEntry(entry, date);
   if (!entry) return branches;
   const firebaseUpdates: Record<string, unknown> = {};
+  const beforeStock = entry.stock.map(stockItem => ({ ...stockItem }));
   const existingIndex = entry.stock.findIndex(s => s.category === item.category && (s.shelfSize || '') === (item.shelfSize || '') && s.color === item.color);
   if (existingIndex !== -1) {
     entry.stock[existingIndex].quantity += item.quantity;
@@ -606,7 +727,7 @@ export function addStockItem(branchId: string, date: string, item: Omit<StockIte
   backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before stock receive recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates, 'stock item add/receive');
+  updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'receive-production', 'stock item add/receive'));
   return branches;
 }
 
@@ -622,12 +743,24 @@ export function deleteStockItem(branchId: string, date: string, stockId: string)
   const entry = branch.dateEntries[entryIndex];
   assertValidDateEntry(entry, date);
   if (!entry) return branches;
+  const beforeStock = entry.stock.map(item => ({ ...item }));
   const stockIndex = getStockIndex(entry, stockId);
+  const deletedStock = entry.stock[stockIndex];
   entry.stock = entry.stock.filter(s => s.id !== stockId);
+  entry.manualStockEditedAt = new Date().toISOString();
+  entry.manualStockEditReason = 'manual stock item delete';
   cachedBranches = branches;
   if (stockIndex !== -1) {
     const firebaseStockIndex = getFirebaseStockIndex(branchId, date, stockId, stockIndex);
-    softDeleteProductChild([firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex], 'stock item soft delete');
+    updateProductChildren({
+      [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)]: {
+        ...deletedStock,
+        deleted: true,
+        deletedAt: new Date().toISOString(),
+      },
+      [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'manualStockEditedAt')]: entry.manualStockEditedAt,
+      [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'manualStockEditReason')]: entry.manualStockEditReason,
+    }, stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'stock item soft delete'));
   }
   return branches;
 }
@@ -645,14 +778,17 @@ export function updateDateStock(branchId: string, date: string, stock: StockItem
   assertValidDateEntry(entry, date);
   if (!entry) return branches;
   stock.forEach(item => assertNonNegativeQuantity(item.quantity, 'date stock quantity'));
+  const beforeStock = entry.stock.map(item => ({ ...item }));
   entry.stock = stock;
+  entry.manualStockEditedAt = new Date().toISOString();
+  entry.manualStockEditReason = 'manual stock edit';
   const firebaseUpdates: Record<string, unknown> = {
     [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex)]: entry,
   };
   backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before date stock recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates, 'date stock update');
+  updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'date stock update'));
   return branches;
 }
 
@@ -669,6 +805,7 @@ export function addSale(branchId: string, date: string, sale: Omit<SalesEntry, '
   const entry = branch.dateEntries[entryIndex];
   assertValidDateEntry(entry, date);
   if (!entry) return branches;
+  const beforeStock = entry.stock.map(item => ({ ...item }));
   const newSale: SalesEntry = {
     ...sale,
     id: crypto.randomUUID(),
@@ -690,7 +827,7 @@ export function addSale(branchId: string, date: string, sale: Omit<SalesEntry, '
   backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before add sale recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, updates);
   cachedBranches = branches;
-  updateProductChildren(updates, 'add sale');
+  updateProductChildren(updates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'add-sale', 'add sale'));
   return branches;
 }
 
@@ -708,6 +845,7 @@ export function updateSale(branchId: string, date: string, saleId: string, updat
   if (!entry) return branches;
   const saleIdx = entry.sales.findIndex(s => s.id === saleId);
   if (saleIdx === -1) return branches;
+  const beforeStock = entry.stock.map(item => ({ ...item }));
   const oldSale = entry.sales[saleIdx];
   const oldStockIndex = getMatchingStockIndex(entry, oldSale.product, oldSale.color, oldSale.shelfSize || '');
   if (oldStockIndex !== -1) entry.stock[oldStockIndex].quantity += oldSale.quantity;
@@ -732,7 +870,7 @@ export function updateSale(branchId: string, date: string, saleId: string, updat
   backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before edit sale recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates, 'edit sale');
+  updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'edit-sale', 'edit sale'));
   return branches;
 }
 
@@ -751,6 +889,7 @@ export function deleteSale(branchId: string, date: string, saleId: string): Bran
   const saleIndex = entry.sales.findIndex(s => s.id === saleId);
   const sale = entry.sales[saleIndex];
   if (!sale) return branches;
+  const beforeStock = entry.stock.map(item => ({ ...item }));
   const stockIndex = getMatchingStockIndex(entry, sale.product, sale.color, sale.shelfSize || '');
   if (stockIndex !== -1) entry.stock[stockIndex].quantity += sale.quantity;
   entry.sales = entry.sales.filter(s => s.id !== saleId);
@@ -768,7 +907,7 @@ export function deleteSale(branchId: string, date: string, saleId: string): Bran
   backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before delete sale recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates, 'soft delete sale');
+  if (Object.keys(firebaseUpdates).length > 0) updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'delete-sale', 'soft delete sale'));
   return branches;
 }
 
@@ -793,6 +932,7 @@ export function transferStock(
   const toBranch = branches[toBranchIndex];
   assertValidBranch(toBranch, toBranchId);
   if (!toBranch) return cachedBranches;
+  const fromBeforeStock = fromEntry.stock.map(item => ({ ...item }));
   fromItem.quantity -= quantity;
 
   let toEntryIndex = getDateEntryIndex(toBranch, date);
@@ -805,6 +945,7 @@ export function transferStock(
     toBranch.dateEntries.push(toEntry);
     rememberDateEntryIndex(toBranchId, date, firebaseToEntryIndex);
   }
+  const toBeforeStock = toEntry.stock.map(item => ({ ...item }));
   const toStockIndex = getMatchingStockIndex(toEntry, product, color, shelfSize);
   const firebaseFromStockIndex = getFirebaseStockIndex(fromBranchId, date, fromItem.id, fromStockIndex);
   const firebaseUpdates: Record<string, unknown> = {
@@ -826,7 +967,15 @@ export function transferStock(
   recalculateFutureDateEntries(branches, fromBranch, fromBranchId, date, fromEntry.stock, firebaseUpdates);
   recalculateFutureDateEntries(branches, toBranch, toBranchId, date, toEntry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates, 'transfer stock');
+  updateProductChildren(firebaseUpdates, {
+    reason: 'transfer stock',
+    branch: `${fromBranch.name} -> ${toBranch.name}`,
+    date,
+    oldStock: stockAuditSnapshot([...fromBeforeStock, ...toBeforeStock]),
+    newStock: stockAuditSnapshot([...fromEntry.stock, ...toEntry.stock]),
+    approvedStockAction: true,
+    stockChangeReason: 'transfer-stock',
+  });
   return branches;
 }
 
@@ -847,6 +996,7 @@ export function externalTransfer(
   const stockIndex = entry ? getMatchingStockIndex(entry, product, color, shelfSize) : -1;
   const item = entry && stockIndex !== -1 ? entry.stock[stockIndex] : null;
   if (!item || item.quantity < quantity) return cachedBranches;
+  const beforeStock = entry.stock.map(stockItem => ({ ...stockItem }));
   item.quantity -= quantity;
   const firebaseUpdates: Record<string, unknown> = {
     [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', getFirebaseStockIndex(branchId, date, item.id, stockIndex))]: item,
@@ -854,7 +1004,7 @@ export function externalTransfer(
   backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before external transfer recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
-  updateProductChildren(firebaseUpdates, 'external transfer');
+  updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'external-transfer', 'external transfer'));
   return branches;
 }
 
@@ -908,6 +1058,73 @@ export function getAllSales(branches: Branch[]): (SalesEntry & { branchName: str
     }
   }
   return sales;
+}
+
+export type StockAuditResult = {
+  branchId: string;
+  branchName: string;
+  date: string;
+  status: 'ok' | 'mismatch' | 'manual-base' | 'initial-base';
+  expectedStock: number;
+  storedStock: number;
+  mismatchCount: number;
+  reason: string;
+};
+
+export function getStockAuditRows(branch: Branch): StockAuditResult[] {
+  const entries = structuredClone(branch.dateEntries).sort((a, b) => a.date.localeCompare(b.date));
+  const rows: StockAuditResult[] = [];
+  let expectedPreviousClosingStock: StockItem[] | null = null;
+
+  for (const entry of entries) {
+    const storedStock = entry.stock;
+    if (!expectedPreviousClosingStock) {
+      rows.push({
+        branchId: branch.id,
+        branchName: branch.name,
+        date: entry.date,
+        status: 'initial-base',
+        expectedStock: totalStockQuantity(storedStock),
+        storedStock: totalStockQuantity(storedStock),
+        mismatchCount: 0,
+        reason: 'First date is treated as stored source of truth',
+      });
+      expectedPreviousClosingStock = storedStock.map(item => ({ ...item }));
+      continue;
+    }
+
+    if (isManualStockAnchor(entry)) {
+      rows.push({
+        branchId: branch.id,
+        branchName: branch.name,
+        date: entry.date,
+        status: 'manual-base',
+        expectedStock: totalStockQuantity(storedStock),
+        storedStock: totalStockQuantity(storedStock),
+        mismatchCount: 0,
+        reason: 'Manual stock edit is source of truth',
+      });
+      expectedPreviousClosingStock = storedStock.map(item => ({ ...item }));
+      continue;
+    }
+
+    const expectedStock = cloneClosingStockWithSalesApplied(expectedPreviousClosingStock, entry);
+    const mismatches = stockMismatchCount(expectedStock, storedStock);
+    const status = mismatches > 0 ? 'mismatch' : 'ok';
+    rows.push({
+      branchId: branch.id,
+      branchName: branch.name,
+      date: entry.date,
+      status,
+      expectedStock: totalStockQuantity(expectedStock),
+      storedStock: totalStockQuantity(storedStock),
+      mismatchCount: mismatches,
+      reason: status === 'ok' ? 'Stored stock matches calculated closing stock' : 'Stored stock differs from expected closing stock',
+    });
+    expectedPreviousClosingStock = expectedStock;
+  }
+
+  return rows;
 }
 
 export function getRecalculatedDateEntries(branch: Branch): DateEntry[] {

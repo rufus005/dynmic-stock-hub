@@ -27,6 +27,8 @@ export interface DateEntry {
   date: string; // YYYY-MM-DD
   stock: StockItem[];
   sales: SalesEntry[];
+  manualStockEditedAt?: string;
+  manualStockEditReason?: string;
 }
 
 export interface Branch {
