@@ -30,6 +30,8 @@ type WriteOptions = {
 type SanitizeResult = {
   value: unknown;
   removedUndefinedFieldsCount: number;
+  convertedNaNFieldsCount: number;
+  removedInvalidFieldsCount: number;
 };
 
 const APPROVED_STOCK_CHANGE_REASONS = new Set([
@@ -59,65 +61,142 @@ function failProtection(reason: string, details: Record<string, unknown>): never
 
 export function sanitizeForFirebase(value: unknown): SanitizeResult {
   if (value === undefined) {
-    return { value: undefined, removedUndefinedFieldsCount: 1 };
+    return {
+      value: undefined,
+      removedUndefinedFieldsCount: 1,
+      convertedNaNFieldsCount: 0,
+      removedInvalidFieldsCount: 0,
+    };
   }
 
   if (value === null || typeof value === 'string' || typeof value === 'boolean') {
-    return { value, removedUndefinedFieldsCount: 0 };
+    return {
+      value,
+      removedUndefinedFieldsCount: 0,
+      convertedNaNFieldsCount: 0,
+      removedInvalidFieldsCount: 0,
+    };
   }
 
   if (typeof value === 'number') {
-    return { value: Number.isFinite(value) ? value : null, removedUndefinedFieldsCount: 0 };
+    return {
+      value: Number.isFinite(value) ? value : 0,
+      removedUndefinedFieldsCount: 0,
+      convertedNaNFieldsCount: Number.isFinite(value) ? 0 : 1,
+      removedInvalidFieldsCount: 0,
+    };
   }
 
   if (Array.isArray(value)) {
     let removedUndefinedFieldsCount = 0;
+    let convertedNaNFieldsCount = 0;
+    let removedInvalidFieldsCount = 0;
     const sanitized = value.map(item => {
       const result = sanitizeForFirebase(item);
       removedUndefinedFieldsCount += result.removedUndefinedFieldsCount;
+      convertedNaNFieldsCount += result.convertedNaNFieldsCount;
+      removedInvalidFieldsCount += result.removedInvalidFieldsCount;
       return result.value === undefined ? null : result.value;
     });
-    return { value: sanitized, removedUndefinedFieldsCount };
+    return { value: sanitized, removedUndefinedFieldsCount, convertedNaNFieldsCount, removedInvalidFieldsCount };
   }
 
   if (typeof value === 'object') {
     let removedUndefinedFieldsCount = 0;
+    let convertedNaNFieldsCount = 0;
+    let removedInvalidFieldsCount = 0;
     const sanitized: Record<string, unknown> = {};
     Object.entries(value as Record<string, unknown>).forEach(([key, child]) => {
       const result = sanitizeForFirebase(child);
       removedUndefinedFieldsCount += result.removedUndefinedFieldsCount;
+      convertedNaNFieldsCount += result.convertedNaNFieldsCount;
+      removedInvalidFieldsCount += result.removedInvalidFieldsCount;
       if (result.value !== undefined) {
         sanitized[key] = result.value;
       }
     });
-    return { value: sanitized, removedUndefinedFieldsCount };
+    return { value: sanitized, removedUndefinedFieldsCount, convertedNaNFieldsCount, removedInvalidFieldsCount };
   }
 
-  return { value: null, removedUndefinedFieldsCount: 0 };
+  return {
+    value: undefined,
+    removedUndefinedFieldsCount: 0,
+    convertedNaNFieldsCount: 0,
+    removedInvalidFieldsCount: 1,
+  };
 }
 
-function logSanitizedPayload(operation: string, paths: string[], removedUndefinedFieldsCount: number) {
-  console.log('[Firebase payload sanitized]', {
+function getPayloadSizeBytes(value: unknown): number {
+  try {
+    return JSON.stringify(value)?.length ?? 0;
+  } catch {
+    return -1;
+  }
+}
+
+function countEmptyObjects(value: unknown): number {
+  if (!value || typeof value !== 'object') return 0;
+  if (Array.isArray(value)) return value.reduce((total, item) => total + countEmptyObjects(item), 0);
+  const objectValue = value as Record<string, unknown>;
+  const childCount = Object.values(objectValue).reduce((total, child) => total + countEmptyObjects(child), 0);
+  return Object.keys(objectValue).length === 0 ? childCount + 1 : childCount;
+}
+
+function isPermissionDeniedError(error: unknown): boolean {
+  const errorRecord = error as { code?: unknown; message?: unknown };
+  const code = typeof errorRecord?.code === 'string' ? errorRecord.code : '';
+  const message = typeof errorRecord?.message === 'string' ? errorRecord.message : String(error || '');
+  return /permission.?denied/i.test(code) || /permission.?denied/i.test(message);
+}
+
+function logFirebaseWritePayload(
+  operation: string,
+  paths: string[],
+  payload: unknown,
+  options: Partial<WriteOptions>,
+  sanitized: Omit<SanitizeResult, 'value'>
+) {
+  const normalizedPaths = paths.map(normalizePath);
+  console.log('[Firebase write payload]', {
     operation,
-    sanitizedPayloadPathsCount: paths.length,
-    removedUndefinedFieldsCount,
-    paths,
+    actionType: options.action || operation,
+    entity: options.entity || null,
+    reason: options.stockChangeReason || options.reason || null,
+    branch: options.branch || null,
+    date: options.date || null,
+    writePaths: normalizedPaths,
+    payload,
+    payloadSizeBytes: getPayloadSizeBytes(payload),
+    sanitizedPayloadPathsCount: normalizedPaths.length,
+    removedUndefinedFieldsCount: sanitized.removedUndefinedFieldsCount,
+    convertedNaNFieldsCount: sanitized.convertedNaNFieldsCount,
+    removedInvalidFieldsCount: sanitized.removedInvalidFieldsCount,
+    emptyObjectWritesCount: countEmptyObjects(payload),
   });
 }
 
 function sanitizeUpdatePayload(updates: Record<string, unknown>) {
   const sanitizedUpdates: Record<string, unknown> = {};
   let removedUndefinedFieldsCount = 0;
+  let convertedNaNFieldsCount = 0;
+  let removedInvalidFieldsCount = 0;
 
   Object.entries(updates).forEach(([path, value]) => {
     const result = sanitizeForFirebase(value);
     removedUndefinedFieldsCount += result.removedUndefinedFieldsCount;
+    convertedNaNFieldsCount += result.convertedNaNFieldsCount;
+    removedInvalidFieldsCount += result.removedInvalidFieldsCount;
     if (result.value !== undefined) {
       sanitizedUpdates[path] = result.value;
     }
   });
 
-  return { sanitizedUpdates, removedUndefinedFieldsCount };
+  return {
+    sanitizedUpdates,
+    removedUndefinedFieldsCount,
+    convertedNaNFieldsCount,
+    removedInvalidFieldsCount,
+  };
 }
 
 function isProductsRootPath(path: string): boolean {
@@ -133,6 +212,14 @@ function isDangerousProductsWritePath(path: string): boolean {
 function assertSafePath(path: string) {
   const normalized = normalizePath(path);
   if (!normalized) failProtection('Firebase write path is empty', { path });
+  if (/[.#$\[\]]/.test(normalized)) {
+    failProtection(`Invalid Firebase write path: ${path}`, {
+      path,
+      normalized,
+      failureType: 'invalid-path',
+      invalidCharacters: '. # $ [ ]',
+    });
+  }
   if (isDangerousProductsWritePath(normalized)) {
     failProtection(`Blocked unsafe Firebase write path: ${path}`, {
       path,
@@ -283,24 +370,67 @@ async function writeAuditLog(options: WriteOptions, paths: string[]) {
     ...auditPayload(options, paths),
   };
   const sanitized = sanitizeForFirebase(auditValue);
-  logSanitizedPayload('audit-log', [AUDIT_LOGS_PATH], sanitized.removedUndefinedFieldsCount);
-  await set(auditRef, sanitized.value);
+  const payload = sanitized.value === undefined ? null : sanitized.value;
+  logFirebaseWritePayload('audit-log', [AUDIT_LOGS_PATH], payload, options, sanitized);
+  try {
+    await set(auditRef, payload);
+  } catch (error) {
+    console.error('[Firebase write rejected after protection passed]', {
+      failureType: 'firebase-write-error',
+      operation: 'audit-log',
+      permissionDenied: isPermissionDeniedError(error),
+      writePaths: [AUDIT_LOGS_PATH],
+      payload,
+      payloadSizeBytes: getPayloadSizeBytes(payload),
+      branch: options.branch || null,
+      date: options.date || null,
+      actionType: options.action,
+      reason: options.stockChangeReason || options.reason || null,
+      error,
+    });
+    throw error;
+  }
 }
 
 export async function safeSetPath(path: string, value: unknown, options: WriteOptions) {
   const normalized = normalizePath(path);
   assertSafePath(normalized);
   const sanitized = sanitizeForFirebase(value);
-  logSanitizedPayload('set', [normalized], sanitized.removedUndefinedFieldsCount);
-  assertNoNegativeStock(sanitized.value, normalized);
-  assertApprovedStockWrite([[normalized, sanitized.value]], options);
-  await set(ref(db, normalized), sanitized.value === undefined ? null : sanitized.value);
+  const payload = sanitized.value === undefined ? null : sanitized.value;
+  logFirebaseWritePayload('set', [normalized], payload, options, sanitized);
+  assertNoNegativeStock(payload, normalized);
+  assertApprovedStockWrite([[normalized, payload]], options);
+  try {
+    await set(ref(db, normalized), payload);
+  } catch (error) {
+    console.error('[Firebase write rejected after protection passed]', {
+      failureType: 'firebase-write-error',
+      operation: 'set',
+      permissionDenied: isPermissionDeniedError(error),
+      writePaths: [normalized],
+      payload,
+      payloadSizeBytes: getPayloadSizeBytes(payload),
+      branch: options.branch || null,
+      date: options.date || null,
+      actionType: options.action,
+      reason: options.stockChangeReason || options.reason || null,
+      error,
+    });
+    throw error;
+  }
   await writeAuditLog(options, [normalized]);
 }
 
 export async function safeUpdatePaths(updates: Record<string, unknown>, options: WriteOptions) {
-  const { sanitizedUpdates, removedUndefinedFieldsCount } = sanitizeUpdatePayload(updates);
-  logSanitizedPayload('update', Object.keys(sanitizedUpdates).map(normalizePath), removedUndefinedFieldsCount);
+  const sanitized = sanitizeUpdatePayload(updates);
+  const { sanitizedUpdates } = sanitized;
+  logFirebaseWritePayload(
+    'update',
+    Object.keys(sanitizedUpdates).map(normalizePath),
+    sanitizedUpdates,
+    options,
+    sanitized
+  );
   assertSafeMultiPathUpdate(sanitizedUpdates);
   Object.entries(sanitizedUpdates).forEach(([path, value]) => assertNoNegativeStock(value, path));
   Object.keys(sanitizedUpdates)
@@ -320,7 +450,14 @@ export async function safeUpdatePaths(updates: Record<string, unknown>, options:
   } catch (error) {
     console.error('[Firebase write rejected after protection passed]', {
       failureType: 'firebase-write-error',
+      operation: 'update',
+      permissionDenied: isPermissionDeniedError(error),
       paths: Object.keys(sanitizedUpdates).map(normalizePath),
+      payload: sanitizedUpdates,
+      payloadSizeBytes: getPayloadSizeBytes(sanitizedUpdates),
+      branch: options.branch || null,
+      date: options.date || null,
+      actionType: options.action,
       reason: options.stockChangeReason || options.reason || '',
       error,
     });
@@ -337,8 +474,26 @@ export async function safeSoftDeletePath(path: string, options: Omit<WriteOption
     deletedAt: new Date().toISOString(),
   };
   const sanitized = sanitizeForFirebase(value);
-  logSanitizedPayload('soft-delete', [normalized], sanitized.removedUndefinedFieldsCount);
-  await update(ref(db, normalized), sanitized.value as Record<string, unknown>);
+  const payload = sanitized.value === undefined ? null : sanitized.value;
+  logFirebaseWritePayload('soft-delete', [normalized], payload, options, sanitized);
+  try {
+    await update(ref(db, normalized), payload as Record<string, unknown>);
+  } catch (error) {
+    console.error('[Firebase write rejected after protection passed]', {
+      failureType: 'firebase-write-error',
+      operation: 'soft-delete',
+      permissionDenied: isPermissionDeniedError(error),
+      writePaths: [normalized],
+      payload,
+      payloadSizeBytes: getPayloadSizeBytes(payload),
+      branch: options.branch || null,
+      date: options.date || null,
+      actionType: 'soft-delete',
+      reason: options.reason || null,
+      error,
+    });
+    throw error;
+  }
   await writeAuditLog({ ...options, action: 'soft-delete' }, [normalized]);
 }
 
@@ -357,8 +512,25 @@ export async function createFirebaseBackup(path: string, value: unknown, reason:
     data: value,
   };
   const sanitized = sanitizeForFirebase(backupValue);
-  logSanitizedPayload('backup', [`${BACKUPS_PATH}/${today}/${backupRef.key}`], sanitized.removedUndefinedFieldsCount);
-  await set(backupRef, sanitized.value);
+  const payload = sanitized.value === undefined ? null : sanitized.value;
+  const backupPath = `${BACKUPS_PATH}/${today}/${backupRef.key}`;
+  logFirebaseWritePayload('backup', [backupPath], payload, { action: 'backup', entity: 'backup', reason }, sanitized);
+  try {
+    await set(backupRef, payload);
+  } catch (error) {
+    console.error('[Firebase write rejected after protection passed]', {
+      failureType: 'firebase-write-error',
+      operation: 'backup',
+      permissionDenied: isPermissionDeniedError(error),
+      writePaths: [backupPath],
+      payload,
+      payloadSizeBytes: getPayloadSizeBytes(payload),
+      actionType: 'backup',
+      reason,
+      error,
+    });
+    throw error;
+  }
   await writeAuditLog({ action: 'backup', entity: 'backup', reason }, [`${BACKUPS_PATH}/${today}/${backupRef.key}`]);
 }
 

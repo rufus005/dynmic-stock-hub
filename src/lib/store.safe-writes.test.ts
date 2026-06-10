@@ -845,6 +845,58 @@ describe('store Firebase product writes', () => {
     expect(branches[0].dateEntries[0].stock[0].quantity).toBe(150);
   });
 
+  it('sanitizes undefined, NaN, and invalid values before Firebase writes', async () => {
+    const protection = await import('./firebaseProtection');
+
+    await protection.safeSetPath(
+      'production_history/mock-production-id',
+      {
+        id: 'mock-production-id',
+        product: 'JUMBO',
+        quantity: Number.NaN,
+        missing: undefined,
+        invalidCallback: () => undefined,
+        tags: [undefined, Number.NaN, 'received'],
+      },
+      { action: 'set', entity: 'production-history', reason: 'test sanitize' }
+    );
+
+    const payload = firebaseCalls.set.mock.calls.find(([refArg]) => refArg.path === 'production_history/mock-production-id')?.[1] as {
+      quantity?: number;
+      missing?: unknown;
+      invalidCallback?: unknown;
+      tags?: unknown[];
+    };
+    expect(payload.quantity).toBe(0);
+    expect(payload.tags).toEqual([null, 0, 'received']);
+    expect('missing' in payload).toBe(false);
+    expect('invalidCallback' in payload).toBe(false);
+    expect(containsUndefined(payload)).toBe(false);
+  });
+
+  it('blocks invalid Firebase paths before write', async () => {
+    const protection = await import('./firebaseProtection');
+
+    await expect(protection.safeSetPath(
+      'products/0/dateEntries/0/stock/bad.key',
+      { id: 'stock-1', quantity: 1 },
+      {
+        action: 'set',
+        entity: 'products-child',
+        reason: 'manual-stock-edit',
+        approvedStockAction: true,
+        stockChangeReason: 'manual-stock-edit',
+        oldStock: { total: 0, rows: [] },
+        newStock: { total: 1, rows: [{ category: '', shelfSize: '', color: '', quantity: 1 }] },
+      }
+    )).rejects.toThrow('Invalid Firebase write path');
+
+    expect(firebaseCalls.set).not.toHaveBeenCalledWith(
+      expect.objectContaining({ path: 'products/0/dateEntries/0/stock/bad.key' }),
+      expect.anything()
+    );
+  });
+
   it('awaits add sale write and returns only the refetched products snapshot', async () => {
     vi.resetModules();
     const store = await import('./store');
@@ -1080,5 +1132,43 @@ describe('store Firebase product writes', () => {
     expect(updateKeys).not.toContain('products');
     expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
     expect(branches[0].dateEntries[0].stock[0].quantity).toBe(6);
+  });
+
+  it('writes production and transfer history through sanitized exact child paths', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+
+    await store.logProductionReceive({
+      date: '2026-06-10',
+      branchId: 'branch-1',
+      branchName: 'Branch One',
+      product: 'JUMBO',
+      color: 'Ivory',
+      shelfSize: undefined as unknown as string,
+      quantity: 3,
+      fromName: undefined,
+    });
+    await store.logTransfer({
+      date: '2026-06-10',
+      fromBranchId: 'branch-1',
+      fromBranchName: 'Branch One',
+      toBranchId: 'branch-2',
+      toBranchName: 'Branch Two',
+      product: 'JUMBO',
+      color: 'Ivory',
+      shelfSize: undefined as unknown as string,
+      quantity: 1,
+      type: 'internal',
+    });
+
+    const setCalls = firebaseCalls.set.mock.calls.map(([refArg, value]) => ({ path: refArg.path, value }));
+    const productionWrite = setCalls.find(call => call.path === 'production_history/mock-push-key');
+    const transferWrite = setCalls.find(call => call.path === 'transfer_history/mock-push-key');
+
+    expect(productionWrite?.value).toEqual(expect.objectContaining({ id: 'mock-push-key', quantity: 3 }));
+    expect(transferWrite?.value).toEqual(expect.objectContaining({ id: 'mock-push-key', quantity: 1 }));
+    expect(containsUndefined(productionWrite?.value)).toBe(false);
+    expect(containsUndefined(transferWrite?.value)).toBe(false);
+    expect(firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates))).not.toContain('products');
   });
 });
