@@ -16,7 +16,8 @@ interface DataContextType {
   removeBranch: (id: string) => void;
   addDateEntry: (branchId: string, date: string, options?: { source?: string }) => void;
   deleteDateEntry: (branchId: string, date: string) => void;
-  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => void;
+  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => Branch[];
+  acceptStoredStockAsCorrect: (branchId: string, date: string) => Branch[];
   addStockItem: (branchId: string, date: string, item: Omit<StockItem, 'id'>) => void;
   updateStockItem: (branchId: string, date: string, stockId: string, updates: Partial<StockItem>) => void;
   deleteStockItem: (branchId: string, date: string, stockId: string) => void;
@@ -191,7 +192,16 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, []);
   const deleteDateEntry = useCallback((branchId: string, date: string) => setBranches(store.deleteDateEntry(branchId, date)), []);
 
-  const updateDateStock = useCallback((branchId: string, date: string, stock: StockItem[]) => setBranches(store.updateDateStock(branchId, date, stock)), []);
+  const updateDateStock = useCallback((branchId: string, date: string, stock: StockItem[]) => {
+    const updatedBranches = store.updateDateStock(branchId, date, stock);
+    setBranches(updatedBranches);
+    return updatedBranches;
+  }, []);
+  const acceptStoredStockAsCorrect = useCallback((branchId: string, date: string) => {
+    const updatedBranches = store.acceptStoredStockAsCorrect(branchId, date);
+    setBranches(updatedBranches);
+    return updatedBranches;
+  }, []);
   const addStockItemFn = useCallback((branchId: string, date: string, item: Omit<StockItem, 'id'>) => setBranches(store.addStockItem(branchId, date, item)), []);
   const updateStockItemFn = useCallback((branchId: string, date: string, stockId: string, updates: Partial<StockItem>) => setBranches(store.updateStockItem(branchId, date, stockId, updates)), []);
   const deleteStockItemFn = useCallback((branchId: string, date: string, stockId: string) => setBranches(store.deleteStockItem(branchId, date, stockId)), []);
@@ -312,6 +322,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
         addDateEntry,
         deleteDateEntry,
         updateDateStock,
+        acceptStoredStockAsCorrect,
         addStockItem: addStockItemFn,
         updateStockItem: updateStockItemFn,
         deleteStockItem: deleteStockItemFn,

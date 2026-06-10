@@ -249,6 +249,8 @@ function isManualStockAnchor(entry: DateEntry): boolean {
   return Boolean(entry.manualStockEditedAt);
 }
 
+const MANUAL_STOCK_EDIT_REASON = 'manual-stock-edit';
+
 function stockQuantityByKey(stock: StockItem[], key: string): number {
   return stockMap(stock).get(key)?.quantity || 0;
 }
@@ -683,7 +685,7 @@ export function updateStockItem(branchId: string, date: string, stockId: string,
   if (idx !== -1) {
     entry.stock[idx] = { ...entry.stock[idx], ...updates };
     entry.manualStockEditedAt = new Date().toISOString();
-    entry.manualStockEditReason = 'manual stock item update';
+    entry.manualStockEditReason = MANUAL_STOCK_EDIT_REASON;
     assertNonNegativeQuantity(entry.stock[idx].quantity, 'stock quantity');
     const firebaseStockIndex = getFirebaseStockIndex(branchId, date, stockId, idx);
     firebaseUpdates[productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'stock', firebaseStockIndex)] = entry.stock[idx];
@@ -748,7 +750,7 @@ export function deleteStockItem(branchId: string, date: string, stockId: string)
   const deletedStock = entry.stock[stockIndex];
   entry.stock = entry.stock.filter(s => s.id !== stockId);
   entry.manualStockEditedAt = new Date().toISOString();
-  entry.manualStockEditReason = 'manual stock item delete';
+  entry.manualStockEditReason = MANUAL_STOCK_EDIT_REASON;
   cachedBranches = branches;
   if (stockIndex !== -1) {
     const firebaseStockIndex = getFirebaseStockIndex(branchId, date, stockId, stockIndex);
@@ -781,7 +783,7 @@ export function updateDateStock(branchId: string, date: string, stock: StockItem
   const beforeStock = entry.stock.map(item => ({ ...item }));
   entry.stock = stock;
   entry.manualStockEditedAt = new Date().toISOString();
-  entry.manualStockEditReason = 'manual stock edit';
+  entry.manualStockEditReason = MANUAL_STOCK_EDIT_REASON;
   const firebaseUpdates: Record<string, unknown> = {
     [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex)]: entry,
   };
@@ -789,6 +791,33 @@ export function updateDateStock(branchId: string, date: string, stock: StockItem
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
   updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'date stock update'));
+  return branches;
+}
+
+export function acceptStoredStockAsCorrect(branchId: string, date: string): Branch[] {
+  const branches = structuredClone(cachedBranches);
+  const branchIndex = getBranchIndex(branches, branchId);
+  const firebaseBranchIndex = getFirebaseBranchIndex(branches, branchId);
+  const branch = branches[branchIndex];
+  assertValidBranch(branch, branchId);
+  if (!branch) return branches;
+  const entryIndex = getDateEntryIndex(branch, date);
+  const firebaseEntryIndex = getFirebaseDateEntryIndex(branchId, date, entryIndex);
+  const entry = branch.dateEntries[entryIndex];
+  assertValidDateEntry(entry, date);
+  if (!entry) return branches;
+
+  const beforeStock = entry.stock.map(item => ({ ...item }));
+  entry.manualStockEditedAt = new Date().toISOString();
+  entry.manualStockEditReason = MANUAL_STOCK_EDIT_REASON;
+  const firebaseUpdates: Record<string, unknown> = {
+    [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'manualStockEditedAt')]: entry.manualStockEditedAt,
+    [productPath(firebaseBranchIndex, 'dateEntries', firebaseEntryIndex, 'manualStockEditReason')]: entry.manualStockEditReason,
+  };
+  backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before accepted stored stock recalculation');
+  recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
+  cachedBranches = branches;
+  updateProductChildren(firebaseUpdates, stockWriteAudit(branch, date, beforeStock, entry.stock, MANUAL_STOCK_EDIT_REASON, 'accept stored stock as correct'));
   return branches;
 }
 

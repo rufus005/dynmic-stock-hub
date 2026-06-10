@@ -410,6 +410,109 @@ describe('store Firebase product writes', () => {
     expect(auditRows.find(row => row.date === '2026-06-06')?.status).toBe('ok');
   });
 
+  it('saves manual stock edits with a manual anchor reason and audits future dates from that stock', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    let branches = store.initCache([
+      {
+        id: 'branch-1',
+        name: 'KR PURAM',
+        dateEntries: [
+          {
+            date: '2026-06-04',
+            stock: [{ id: 'stock-1', category: 'DOUBLE DECKOR', shelfSize: '5', color: 'Coffee Beige', quantity: 78 }],
+            sales: [],
+          },
+          {
+            date: '2026-06-05',
+            stock: [{ id: 'stock-2', category: 'DOUBLE DECKOR', shelfSize: '5', color: 'Coffee Beige', quantity: 78 }],
+            sales: [],
+          },
+          {
+            date: '2026-06-06',
+            stock: [{ id: 'stock-3', category: 'DOUBLE DECKOR', shelfSize: '5', color: 'Coffee Beige', quantity: 108 }],
+            sales: [{ id: 'sale-1', date: '2026-06-06', customerNumber: 'C-1', driverName: 'Driver', product: 'DOUBLE DECKOR', color: 'Coffee Beige', shelfSize: '5', quantity: 2, price: 100, driverCharge: 10, collection: 90, branchId: 'branch-1' }],
+          },
+        ],
+      },
+    ]);
+    vi.clearAllMocks();
+
+    branches = store.updateDateStock('branch-1', '2026-06-05', [
+      { id: 'stock-2', category: 'DOUBLE DECKOR', shelfSize: '5', color: 'Coffee Beige', quantity: 110 },
+    ]);
+
+    const anchor = branches[0].dateEntries.find(entry => entry.date === '2026-06-05')!;
+    expect(anchor.manualStockEditedAt).toEqual(expect.any(String));
+    expect(anchor.manualStockEditReason).toBe('manual-stock-edit');
+    expect(branches[0].dateEntries.find(entry => entry.date === '2026-06-06')!.stock[0].quantity).toBe(108);
+
+    await flushFirebaseQueue();
+    const updateCalls = firebaseCalls.update.mock.calls.map(([, updates]) => updates as Record<string, unknown>);
+    const updateKeys = updateCalls.flatMap(updates => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/1');
+    expect(updateKeys).toContain('products/0/dateEntries/2');
+    expect(updateKeys).not.toContain('products');
+    expect(updateCalls.some(updates => {
+      const entry = updates['products/0/dateEntries/1'] as { manualStockEditReason?: string } | undefined;
+      return entry?.manualStockEditReason === 'manual-stock-edit';
+    })).toBe(true);
+
+    const auditRows = store.getStockAuditRows(branches[0]);
+    expect(auditRows.find(row => row.date === '2026-06-05')?.status).toBe('manual-base');
+    expect(auditRows.find(row => row.date === '2026-06-05')?.expectedStock).toBe(110);
+    expect(auditRows.find(row => row.date === '2026-06-06')?.status).toBe('ok');
+    expect(auditRows.find(row => row.date === '2026-06-06')?.expectedStock).toBe(108);
+  });
+
+  it('accepts stored stock as a manual anchor without recalculating older dates', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    let branches = store.initCache([
+      {
+        id: 'branch-1',
+        name: 'KR PURAM',
+        dateEntries: [
+          {
+            date: '2026-06-04',
+            stock: [{ id: 'stock-1', category: 'DOUBLE DECKOR', shelfSize: '5', color: 'Coffee Beige', quantity: 78 }],
+            sales: [],
+          },
+          {
+            date: '2026-06-05',
+            stock: [{ id: 'stock-2', category: 'DOUBLE DECKOR', shelfSize: '5', color: 'Coffee Beige', quantity: 110 }],
+            sales: [],
+          },
+          {
+            date: '2026-06-06',
+            stock: [{ id: 'stock-3', category: 'DOUBLE DECKOR', shelfSize: '5', color: 'Coffee Beige', quantity: 108 }],
+            sales: [{ id: 'sale-1', date: '2026-06-06', customerNumber: 'C-1', driverName: 'Driver', product: 'DOUBLE DECKOR', color: 'Coffee Beige', shelfSize: '5', quantity: 2, price: 100, driverCharge: 10, collection: 90, branchId: 'branch-1' }],
+          },
+        ],
+      },
+    ]);
+    expect(store.getStockAuditRows(branches[0]).filter(row => row.status === 'mismatch').map(row => row.date)).toEqual(['2026-06-05', '2026-06-06']);
+    vi.clearAllMocks();
+
+    branches = store.acceptStoredStockAsCorrect('branch-1', '2026-06-05');
+
+    const auditRows = store.getStockAuditRows(branches[0]);
+    expect(auditRows.find(row => row.date === '2026-06-04')?.status).toBe('initial-base');
+    expect(auditRows.find(row => row.date === '2026-06-04')?.storedStock).toBe(78);
+    expect(auditRows.find(row => row.date === '2026-06-05')?.status).toBe('manual-base');
+    expect(auditRows.find(row => row.date === '2026-06-05')?.expectedStock).toBe(110);
+    expect(auditRows.find(row => row.date === '2026-06-06')?.status).toBe('ok');
+    expect(auditRows.find(row => row.date === '2026-06-06')?.expectedStock).toBe(108);
+
+    await flushFirebaseQueue();
+    const updateKeys = firebaseCalls.update.mock.calls.flatMap(([, updates]) => Object.keys(updates));
+    expect(updateKeys).toContain('products/0/dateEntries/1/manualStockEditedAt');
+    expect(updateKeys).toContain('products/0/dateEntries/1/manualStockEditReason');
+    expect(updateKeys).toContain('products/0/dateEntries/2');
+    expect(updateKeys).not.toContain('products/0/dateEntries/0');
+    expect(updateKeys).not.toContain('products');
+  });
+
   it('recalculates future stock for stock edits, production receives, and transfers', async () => {
     vi.resetModules();
     const store = await import('./store');

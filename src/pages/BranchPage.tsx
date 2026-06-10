@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useRef } from 'react';
 import { useParams, useNavigate, Navigate } from 'react-router-dom';
 import { useData } from '@/contexts/DataContext';
 import { useAuth } from '@/contexts/AuthContext';
-import { StockItem, SalesEntry, DynamicCategory } from '@/lib/types';
+import { Branch, StockItem, SalesEntry, DynamicCategory } from '@/lib/types';
 import { getRecalculatedDateEntries, getStockAuditRows, type StockAuditResult } from '@/lib/store';
 import { motion } from 'framer-motion';
 import { ArrowLeft, Save, Plus, Trash2, Pencil, Check, X, Calendar, ChevronRight, ChevronDown, Tag } from 'lucide-react';
@@ -62,7 +62,7 @@ export default function BranchPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const { currentUser } = useAuth();
-  const { branches, updateDateStock, addSale, deleteSale, updateSale, addDateEntry, deleteDateEntry, addStockItem, transferStock, externalTransfer, receiveStock, categories } = useData();
+  const { branches, updateDateStock, acceptStoredStockAsCorrect, addSale, deleteSale, updateSale, addDateEntry, deleteDateEntry, addStockItem, transferStock, externalTransfer, receiveStock, categories } = useData();
   const branch = branches.find(b => b.id === id);
   const displayDateEntries = useMemo(() => branch ? getRecalculatedDateEntries(branch) : [], [branch]);
 
@@ -325,6 +325,7 @@ export default function BranchPage() {
         categories={categories}
         onBack={() => setSelectedDate(null)}
         updateDateStock={updateDateStock}
+        acceptStoredStockAsCorrect={acceptStoredStockAsCorrect}
         addSale={addSale}
         updateSale={updateSale}
         deleteSale={deleteSale}
@@ -339,15 +340,16 @@ export default function BranchPage() {
 }
 
 function DateDetailView({
-  branchId, branchName, dateEntry, branches, categories, onBack, updateDateStock, addSale, updateSale, deleteSale, addStockItem, receiveStock, transferStock, externalTransfer, userRole
+  branchId, branchName, dateEntry, branches, categories, onBack, updateDateStock, acceptStoredStockAsCorrect, addSale, updateSale, deleteSale, addStockItem, receiveStock, transferStock, externalTransfer, userRole
 }: {
   branchId: string;
   branchName: string;
   dateEntry: { date: string; stock: StockItem[]; sales: SalesEntry[] };
-  branches: { id: string; name: string; dateEntries: { date: string; stock: StockItem[]; sales: SalesEntry[] }[] }[];
+  branches: Branch[];
   categories: DynamicCategory[];
   onBack: () => void;
-  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => void;
+  updateDateStock: (branchId: string, date: string, stock: StockItem[]) => Branch[];
+  acceptStoredStockAsCorrect: (branchId: string, date: string) => Branch[];
   addSale: (branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => void;
   updateSale: (branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => void;
   deleteSale: (branchId: string, date: string, saleId: string) => void;
@@ -506,7 +508,11 @@ function DateDetailView({
   };
 
   const saveStock = () => {
-    updateDateStock(branchId, dateEntry.date, localStock);
+    const updatedBranches = updateDateStock(branchId, dateEntry.date, localStock);
+    const updatedBranch = updatedBranches.find(item => item.id === branchId);
+    if (updatedBranch && stockAuditRows) {
+      setStockAuditRows(getStockAuditRows(updatedBranch));
+    }
     toast.success('Stock saved');
   };
 
@@ -531,6 +537,17 @@ function DateDetailView({
     } else {
       toast.success('Stock audit passed');
     }
+  };
+
+  const handleAcceptStoredStock = (auditDate: string) => {
+    if (userRole !== 'admin') return;
+    if (!confirm(`Accept stored stock as correct for ${formatEntryDate(auditDate)}? Future dates will use this stock as the base.`)) return;
+    const updatedBranches = acceptStoredStockAsCorrect(branchId, auditDate);
+    const updatedBranch = updatedBranches.find(item => item.id === branchId);
+    if (updatedBranch) {
+      setStockAuditRows(getStockAuditRows(updatedBranch));
+    }
+    toast.success('Stored stock accepted as correct');
   };
 
   const handleAddShelfSizeRow = (catName: string, colors: string[]) => {
@@ -686,9 +703,20 @@ function DateDetailView({
             </div>
             <div className="mt-2 space-y-1">
               {stockAuditRows.filter(row => row.status === 'mismatch').slice(0, 6).map(row => (
-                <div key={row.date} className="flex items-center justify-between gap-3 text-xs">
+                <div key={row.date} className="flex flex-wrap items-center justify-between gap-3 text-xs">
                   <span>{formatEntryDate(row.date)}</span>
-                  <span className="font-mono">Expected {row.expectedStock} / Stored {row.storedStock}</span>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    <span className="font-mono">Expected {row.expectedStock} / Stored {row.storedStock}</span>
+                    {userRole === 'admin' && (
+                      <button
+                        type="button"
+                        onClick={() => handleAcceptStoredStock(row.date)}
+                        className="rounded-md border border-border bg-background px-2 py-1 font-medium text-foreground hover:bg-muted"
+                      >
+                        Accept Stored Stock as Correct
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
               {stockAuditRows.some(row => row.status === 'mismatch') === false && (
