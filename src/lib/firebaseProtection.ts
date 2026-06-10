@@ -44,6 +44,14 @@ function normalizePath(path: string): string {
   return path.replace(/^\/+/, '').replace(/\/+$/, '');
 }
 
+function failProtection(reason: string, details: Record<string, unknown>): never {
+  console.error('[Firebase protection validation failed]', {
+    failureReason: reason,
+    ...details,
+  });
+  throw new Error(reason);
+}
+
 function isProductsRootPath(path: string): boolean {
   const normalized = normalizePath(path);
   return normalized === PRODUCTS_PATH;
@@ -56,15 +64,23 @@ function isDangerousProductsWritePath(path: string): boolean {
 
 function assertSafePath(path: string) {
   const normalized = normalizePath(path);
-  if (!normalized) throw new Error('Firebase write path is empty');
+  if (!normalized) failProtection('Firebase write path is empty', { path });
   if (isDangerousProductsWritePath(normalized)) {
-    throw new Error(`Blocked unsafe Firebase write path: ${path}`);
+    failProtection(`Blocked unsafe Firebase write path: ${path}`, {
+      path,
+      normalized,
+      failureType: 'products-root-write',
+    });
   }
 }
 
 function assertSafeMultiPathUpdate(updates: Record<string, unknown>) {
   const paths = Object.keys(updates);
-  if (paths.length === 0) throw new Error('Firebase update has no child paths');
+  if (paths.length === 0) {
+    failProtection('Firebase update has no child paths', {
+      failureType: 'empty-update',
+    });
+  }
   for (const path of paths) assertSafePath(path);
 }
 
@@ -96,6 +112,15 @@ function isProductsStockWrite(path: string, value: unknown): boolean {
   return /\/dateEntries\/[^/]+\/stock(\/|$)/.test(normalized) || hasStockPayload(value);
 }
 
+function isExactProductsStockChildPath(path: string): boolean {
+  return /^products\/[^/]+\/dateEntries\/[^/]+\/stock\/[^/]+$/.test(normalizePath(path));
+}
+
+function isManualStockMetadataPath(path: string): boolean {
+  return /^products\/[^/]+\/dateEntries\/[^/]+\/manualStockEditedAt$/.test(normalizePath(path))
+    || /^products\/[^/]+\/dateEntries\/[^/]+\/manualStockEditReason$/.test(normalizePath(path));
+}
+
 function normalizeStockRows(snapshot?: StockAuditSnapshot): StockAuditRow[] {
   return [...(snapshot?.rows || [])].sort((a, b) =>
     `${a.category}|${a.shelfSize}|${a.color}`.localeCompare(`${b.category}|${b.shelfSize}|${b.color}`)
@@ -125,15 +150,53 @@ function assertApprovedStockWrite(entries: [string, unknown][], options: WriteOp
 
   const reason = options.stockChangeReason || options.reason || '';
   if (!options.approvedStockAction || !APPROVED_STOCK_CHANGE_REASONS.has(reason)) {
-    throw new Error(`Blocked unapproved automatic stock write: ${stockPaths.join(', ')}`);
+    failProtection(`Blocked unapproved automatic stock write: ${stockPaths.join(', ')}`, {
+      failureType: !options.approvedStockAction ? 'missing-approved-stock-action' : 'missing-approved-reason',
+      stockPaths,
+      reason,
+      approvedStockAction: options.approvedStockAction,
+      allowedReasons: Array.from(APPROVED_STOCK_CHANGE_REASONS),
+    });
   }
 
   if (!options.oldStock || !options.newStock) {
-    throw new Error(`Blocked stock write without old/new audit data: ${stockPaths.join(', ')}`);
+    failProtection(`Blocked stock write without old/new audit data: ${stockPaths.join(', ')}`, {
+      failureType: 'missing-old-new-stock-audit',
+      stockPaths,
+      hasOldStock: Boolean(options.oldStock),
+      hasNewStock: Boolean(options.newStock),
+      reason,
+      branch: options.branch,
+      date: options.date,
+    });
   }
 
   if (reason === 'auto-date-carry-forward' && !isSameStockSnapshot(options.oldStock, options.newStock)) {
-    throw new Error(`Blocked automatic date stock change without exact carry-forward: ${stockPaths.join(', ')}`);
+    failProtection(`Blocked automatic date stock change without exact carry-forward: ${stockPaths.join(', ')}`, {
+      failureType: 'invalid-auto-date-carry-forward',
+      stockPaths,
+      oldStock: options.oldStock,
+      newStock: options.newStock,
+    });
+  }
+
+  if (reason === 'manual-stock-edit') {
+    const invalidManualPaths = entries
+      .map(([path]) => normalizePath(path))
+      .filter(path => path.startsWith(`${PRODUCTS_PATH}/`))
+      .filter(path => isProductsStockWrite(path, entries.find(([entryPath]) => normalizePath(entryPath) === path)?.[1]))
+      .filter(path => !isExactProductsStockChildPath(path) && !/\/dateEntries\/[^/]+$/.test(path));
+    if (invalidManualPaths.length > 0) {
+      failProtection(`Blocked manual stock write with invalid child path: ${invalidManualPaths.join(', ')}`, {
+        failureType: 'invalid-manual-stock-path',
+        invalidManualPaths,
+        allowedPathPatterns: [
+          'products/{branchIndex}/dateEntries/{entryIndex}/stock/{stockIndex}',
+          'products/{branchIndex}/dateEntries/{entryIndex}/manualStockEditedAt',
+          'products/{branchIndex}/dateEntries/{entryIndex}/manualStockEditReason',
+        ],
+      });
+    }
   }
 }
 
@@ -165,8 +228,29 @@ export async function safeSetPath(path: string, value: unknown, options: WriteOp
 export async function safeUpdatePaths(updates: Record<string, unknown>, options: WriteOptions) {
   assertSafeMultiPathUpdate(updates);
   Object.entries(updates).forEach(([path, value]) => assertNoNegativeStock(value, path));
+  Object.keys(updates)
+    .filter(path => isManualStockMetadataPath(path))
+    .forEach(path => {
+      if ((options.stockChangeReason || options.reason) !== 'manual-stock-edit') {
+        failProtection(`Blocked manual stock metadata write without manual-stock-edit reason: ${path}`, {
+          failureType: 'manual-stock-metadata-without-manual-reason',
+          path,
+          reason: options.stockChangeReason || options.reason || '',
+        });
+      }
+    });
   assertApprovedStockWrite(Object.entries(updates), options);
-  await update(ref(db), updates);
+  try {
+    await update(ref(db), updates);
+  } catch (error) {
+    console.error('[Firebase write rejected after protection passed]', {
+      failureType: 'firebase-write-error',
+      paths: Object.keys(updates).map(normalizePath),
+      reason: options.stockChangeReason || options.reason || '',
+      error,
+    });
+    throw error;
+  }
   await writeAuditLog(options, Object.keys(updates).map(normalizePath));
 }
 

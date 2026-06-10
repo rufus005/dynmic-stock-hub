@@ -874,7 +874,7 @@ export function updateDateStock(branchId: string, date: string, stock: StockItem
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
   cachedBranches = branches;
 
-  const auditEntry = stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'date stock update');
+  const auditEntry = stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'manual-stock-edit');
   console.log('[Manual stock edit - Firebase update payload]', {
     branchId,
     date,
@@ -926,7 +926,7 @@ export async function updateDateStockAndRefetch(branchId: string, date: string, 
   backupBranchBeforeRecalculation(firebaseBranchIndex, branch, 'before date stock manual edit recalculation');
   recalculateFutureDateEntries(branches, branch, branchId, date, entry.stock, firebaseUpdates);
 
-  const auditEntry = stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'date stock update');
+  const auditEntry = stockWriteAudit(branch, date, beforeStock, entry.stock, 'manual-stock-edit', 'manual-stock-edit');
   console.log('[Manual stock edit - Firebase authoritative save]', {
     databaseURL: firebaseConfig.databaseURL,
     branchId,

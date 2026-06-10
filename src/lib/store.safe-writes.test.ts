@@ -135,6 +135,70 @@ describe('store Firebase product writes', () => {
     );
   });
 
+  it('allows valid admin Save Stock exact child paths with manual-stock-edit audit data', async () => {
+    const protection = await import('./firebaseProtection');
+    const oldStock = {
+      total: 100,
+      rows: [{ category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 100 }],
+    };
+    const newStock = {
+      total: 150,
+      rows: [{ category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 150 }],
+    };
+
+    await protection.safeUpdatePaths(
+      {
+        'products/0/dateEntries/0/stock/0': { id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 150 },
+        'products/0/dateEntries/0/manualStockEditedAt': '2026-06-10T12:00:00.000Z',
+        'products/0/dateEntries/0/manualStockEditReason': 'manual-stock-edit',
+      },
+      {
+        action: 'update',
+        entity: 'products-child',
+        reason: 'manual-stock-edit',
+        branch: 'Branch One',
+        date: '2026-06-01',
+        oldStock,
+        newStock,
+        approvedStockAction: true,
+        stockChangeReason: 'manual-stock-edit',
+      }
+    );
+
+    expect(firebaseCalls.update).toHaveBeenCalledWith(
+      expect.objectContaining({ path: '' }),
+      expect.objectContaining({
+        'products/0/dateEntries/0/stock/0': expect.objectContaining({ quantity: 150 }),
+        'products/0/dateEntries/0/manualStockEditReason': 'manual-stock-edit',
+      })
+    );
+    expect(firebaseCalls.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ path: 'products' }),
+      expect.anything()
+    );
+  });
+
+  it('blocks approved stock writes when old/new audit data is missing', async () => {
+    const protection = await import('./firebaseProtection');
+
+    await expect(protection.safeUpdatePaths(
+      {
+        'products/0/dateEntries/0/stock/0': { id: 'stock-1', category: 'JUMBO', shelfSize: '5', color: 'Ivory', quantity: 150 },
+      },
+      {
+        action: 'update',
+        entity: 'products-child',
+        reason: 'manual-stock-edit',
+        branch: 'Branch One',
+        date: '2026-06-01',
+        approvedStockAction: true,
+        stockChangeReason: 'manual-stock-edit',
+      }
+    )).rejects.toThrow('Blocked stock write without old/new audit data');
+
+    expect(firebaseCalls.update).not.toHaveBeenCalled();
+  });
+
   it('writes sales, stock, dates, and transfers only to exact products child paths', async () => {
     const store = await import('./store');
     let branches = store.initCache(initialBranches());
