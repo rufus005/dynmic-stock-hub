@@ -27,6 +27,11 @@ type WriteOptions = {
   stockChangeReason?: string;
 };
 
+type SanitizeResult = {
+  value: unknown;
+  removedUndefinedFieldsCount: number;
+};
+
 const APPROVED_STOCK_CHANGE_REASONS = new Set([
   'add-sale',
   'edit-sale',
@@ -50,6 +55,69 @@ function failProtection(reason: string, details: Record<string, unknown>): never
     ...details,
   });
   throw new Error(reason);
+}
+
+export function sanitizeForFirebase(value: unknown): SanitizeResult {
+  if (value === undefined) {
+    return { value: undefined, removedUndefinedFieldsCount: 1 };
+  }
+
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return { value, removedUndefinedFieldsCount: 0 };
+  }
+
+  if (typeof value === 'number') {
+    return { value: Number.isFinite(value) ? value : null, removedUndefinedFieldsCount: 0 };
+  }
+
+  if (Array.isArray(value)) {
+    let removedUndefinedFieldsCount = 0;
+    const sanitized = value.map(item => {
+      const result = sanitizeForFirebase(item);
+      removedUndefinedFieldsCount += result.removedUndefinedFieldsCount;
+      return result.value === undefined ? null : result.value;
+    });
+    return { value: sanitized, removedUndefinedFieldsCount };
+  }
+
+  if (typeof value === 'object') {
+    let removedUndefinedFieldsCount = 0;
+    const sanitized: Record<string, unknown> = {};
+    Object.entries(value as Record<string, unknown>).forEach(([key, child]) => {
+      const result = sanitizeForFirebase(child);
+      removedUndefinedFieldsCount += result.removedUndefinedFieldsCount;
+      if (result.value !== undefined) {
+        sanitized[key] = result.value;
+      }
+    });
+    return { value: sanitized, removedUndefinedFieldsCount };
+  }
+
+  return { value: null, removedUndefinedFieldsCount: 0 };
+}
+
+function logSanitizedPayload(operation: string, paths: string[], removedUndefinedFieldsCount: number) {
+  console.log('[Firebase payload sanitized]', {
+    operation,
+    sanitizedPayloadPathsCount: paths.length,
+    removedUndefinedFieldsCount,
+    paths,
+  });
+}
+
+function sanitizeUpdatePayload(updates: Record<string, unknown>) {
+  const sanitizedUpdates: Record<string, unknown> = {};
+  let removedUndefinedFieldsCount = 0;
+
+  Object.entries(updates).forEach(([path, value]) => {
+    const result = sanitizeForFirebase(value);
+    removedUndefinedFieldsCount += result.removedUndefinedFieldsCount;
+    if (result.value !== undefined) {
+      sanitizedUpdates[path] = result.value;
+    }
+  });
+
+  return { sanitizedUpdates, removedUndefinedFieldsCount };
 }
 
 function isProductsRootPath(path: string): boolean {
@@ -210,25 +278,32 @@ function auditPayload(options: WriteOptions, paths: string[]) {
 
 async function writeAuditLog(options: WriteOptions, paths: string[]) {
   const auditRef = push(ref(db, AUDIT_LOGS_PATH));
-  await set(auditRef, {
+  const auditValue = {
     id: auditRef.key,
     ...auditPayload(options, paths),
-  });
+  };
+  const sanitized = sanitizeForFirebase(auditValue);
+  logSanitizedPayload('audit-log', [AUDIT_LOGS_PATH], sanitized.removedUndefinedFieldsCount);
+  await set(auditRef, sanitized.value);
 }
 
 export async function safeSetPath(path: string, value: unknown, options: WriteOptions) {
   const normalized = normalizePath(path);
   assertSafePath(normalized);
-  assertNoNegativeStock(value, normalized);
-  assertApprovedStockWrite([[normalized, value]], options);
-  await set(ref(db, normalized), value);
+  const sanitized = sanitizeForFirebase(value);
+  logSanitizedPayload('set', [normalized], sanitized.removedUndefinedFieldsCount);
+  assertNoNegativeStock(sanitized.value, normalized);
+  assertApprovedStockWrite([[normalized, sanitized.value]], options);
+  await set(ref(db, normalized), sanitized.value === undefined ? null : sanitized.value);
   await writeAuditLog(options, [normalized]);
 }
 
 export async function safeUpdatePaths(updates: Record<string, unknown>, options: WriteOptions) {
-  assertSafeMultiPathUpdate(updates);
-  Object.entries(updates).forEach(([path, value]) => assertNoNegativeStock(value, path));
-  Object.keys(updates)
+  const { sanitizedUpdates, removedUndefinedFieldsCount } = sanitizeUpdatePayload(updates);
+  logSanitizedPayload('update', Object.keys(sanitizedUpdates).map(normalizePath), removedUndefinedFieldsCount);
+  assertSafeMultiPathUpdate(sanitizedUpdates);
+  Object.entries(sanitizedUpdates).forEach(([path, value]) => assertNoNegativeStock(value, path));
+  Object.keys(sanitizedUpdates)
     .filter(path => isManualStockMetadataPath(path))
     .forEach(path => {
       if ((options.stockChangeReason || options.reason) !== 'manual-stock-edit') {
@@ -239,28 +314,31 @@ export async function safeUpdatePaths(updates: Record<string, unknown>, options:
         });
       }
     });
-  assertApprovedStockWrite(Object.entries(updates), options);
+  assertApprovedStockWrite(Object.entries(sanitizedUpdates), options);
   try {
-    await update(ref(db), updates);
+    await update(ref(db), sanitizedUpdates);
   } catch (error) {
     console.error('[Firebase write rejected after protection passed]', {
       failureType: 'firebase-write-error',
-      paths: Object.keys(updates).map(normalizePath),
+      paths: Object.keys(sanitizedUpdates).map(normalizePath),
       reason: options.stockChangeReason || options.reason || '',
       error,
     });
     throw error;
   }
-  await writeAuditLog(options, Object.keys(updates).map(normalizePath));
+  await writeAuditLog(options, Object.keys(sanitizedUpdates).map(normalizePath));
 }
 
 export async function safeSoftDeletePath(path: string, options: Omit<WriteOptions, 'action'>) {
   const normalized = normalizePath(path);
   assertSafePath(normalized);
-  await update(ref(db, normalized), {
+  const value = {
     deleted: true,
     deletedAt: new Date().toISOString(),
-  });
+  };
+  const sanitized = sanitizeForFirebase(value);
+  logSanitizedPayload('soft-delete', [normalized], sanitized.removedUndefinedFieldsCount);
+  await update(ref(db, normalized), sanitized.value as Record<string, unknown>);
   await writeAuditLog({ ...options, action: 'soft-delete' }, [normalized]);
 }
 
@@ -278,7 +356,9 @@ export async function createFirebaseBackup(path: string, value: unknown, reason:
     createdAt: new Date().toISOString(),
     data: value,
   };
-  await set(backupRef, backupValue);
+  const sanitized = sanitizeForFirebase(backupValue);
+  logSanitizedPayload('backup', [`${BACKUPS_PATH}/${today}/${backupRef.key}`], sanitized.removedUndefinedFieldsCount);
+  await set(backupRef, sanitized.value);
   await writeAuditLog({ action: 'backup', entity: 'backup', reason }, [`${BACKUPS_PATH}/${today}/${backupRef.key}`]);
 }
 

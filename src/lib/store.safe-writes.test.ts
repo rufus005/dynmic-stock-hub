@@ -28,6 +28,13 @@ function flushFirebaseQueue() {
   return new Promise(resolve => setTimeout(resolve, 0));
 }
 
+function containsUndefined(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(containsUndefined);
+  return Object.values(value as Record<string, unknown>).some(containsUndefined);
+}
+
 function initialBranches(): Branch[] {
   return [
     {
@@ -753,6 +760,89 @@ describe('store Firebase product writes', () => {
     expect(firebaseCalls.get).toHaveBeenCalledWith(expect.objectContaining({ path: 'products' }));
     expect(branches[0].dateEntries[0].stock[0].quantity).toBe(150);
     expect(store.getBranches()[0].dateEntries[0].stock[0].quantity).toBe(150);
+  });
+
+  it('sanitizes undefined values in Save Stock backup payload before Firebase writes', async () => {
+    vi.resetModules();
+    const store = await import('./store');
+    store.initCache([
+      {
+        id: 'branch-1',
+        name: 'Test Branch',
+        dateEntries: [
+          {
+            date: '2026-06-05',
+            stock: [
+              {
+                id: 'stock-1',
+                category: 'JUMBO',
+                shelfSize: undefined,
+                color: 'Ivory',
+                quantity: 100,
+                tags: [undefined, 'fast-moving'],
+              } as unknown as Branch['dateEntries'][number]['stock'][number],
+            ],
+            sales: [
+              {
+                id: 'sale-1',
+                date: '2026-06-05',
+                customerNumber: undefined,
+                driverName: 'Driver',
+                product: 'JUMBO',
+                color: 'Ivory',
+                shelfSize: undefined,
+                quantity: 1,
+                price: 100,
+                driverCharge: 10,
+                collection: 90,
+                branchId: 'branch-1',
+              } as unknown as Branch['dateEntries'][number]['sales'][number],
+            ],
+            manualStockEditedAt: undefined,
+          } as unknown as Branch['dateEntries'][number],
+        ],
+      },
+    ]);
+    firebaseCalls.get.mockResolvedValueOnce({
+      val: () => [
+        {
+          id: 'branch-1',
+          name: 'Test Branch',
+          dateEntries: [
+            {
+              date: '2026-06-05',
+              stock: [{ id: 'stock-1', category: 'JUMBO', color: 'Ivory', quantity: 150, tags: [null, 'fast-moving'] }],
+              sales: [],
+              manualStockEditedAt: '2026-06-10T12:00:00.000Z',
+              manualStockEditReason: 'manual-stock-edit',
+            },
+          ],
+        },
+      ],
+    });
+    vi.clearAllMocks();
+
+    const branches = await store.updateDateStockAndRefetch('branch-1', '2026-06-05', [
+      {
+        id: 'stock-1',
+        category: 'JUMBO',
+        shelfSize: undefined,
+        color: 'Ivory',
+        quantity: 150,
+        tags: [undefined, 'fast-moving'],
+      } as unknown as Branch['dateEntries'][number]['stock'][number],
+    ]);
+
+    const setPayloads = firebaseCalls.set.mock.calls.map(([, value]) => value);
+    const updatePayloads = firebaseCalls.update.mock.calls.map(([, value]) => value);
+    expect(setPayloads.some(value => (value as { sourcePath?: unknown })?.sourcePath === 'products/0')).toBe(true);
+    expect([...setPayloads, ...updatePayloads].some(containsUndefined)).toBe(false);
+    expect(updatePayloads.some(value => {
+      const updates = value as Record<string, unknown>;
+      const stock = updates['products/0/dateEntries/0/stock/0'] as { shelfSize?: unknown; tags?: unknown[] };
+      return stock && !('shelfSize' in stock) && Array.isArray(stock.tags) && stock.tags[0] === null;
+    })).toBe(true);
+    expect(branches[0].dateEntries[0].stock[0].quantity).toBe(150);
   });
 
   it('awaits add sale write and returns only the refetched products snapshot', async () => {
