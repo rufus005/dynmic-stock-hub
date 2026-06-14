@@ -4,6 +4,7 @@ import { useData } from '@/contexts/DataContext';
 import { useAuth } from '@/contexts/AuthContext';
 import { Branch, StockItem, SalesEntry, DynamicCategory } from '@/lib/types';
 import { getRecalculatedDateEntries, getStockAuditRows, type StockAuditResult } from '@/lib/store';
+import { getBranchSalesSummary, getLocalDateString } from '@/lib/branchSalesSummary';
 import { motion } from 'framer-motion';
 import { ArrowLeft, Save, Plus, Trash2, Pencil, Check, X, Calendar, ChevronRight, ChevronDown, Tag } from 'lucide-react';
 import AppLayout from '@/components/AppLayout';
@@ -11,7 +12,7 @@ import { toast } from 'sonner';
 
 const DEFAULT_DRIVER_NAMES = ['AKHIL', 'IMRAN', 'KHALEEL', 'KUMAR', 'MUTHUKUMA', 'SAJJID', 'SHABEER', 'YOUNUS', 'BILLA'];
 const DRIVER_SUGGESTIONS_KEY = 'dynamic_driver_suggestions';
-const PAYMENT_MODES = ['Cash', 'UPI', 'Online'] as const;
+const PAYMENT_MODES = ['Cash', 'UPI', 'Online','HYD'] as const;
 
 function normalizeDriverName(name: string) {
   return name.trim().replace(/\s+/g, ' ');
@@ -45,13 +46,6 @@ function getMonthKey(date: string) {
   return `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, '0')}`;
 }
 
-function getLocalDateString(date = new Date()) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
-
 type BranchDateEntry = {
   date: string;
   stock: StockItem[];
@@ -65,6 +59,7 @@ export default function BranchPage() {
   const { branches, updateDateStock, acceptStoredStockAsCorrect, addSale, deleteSale, updateSale, addDateEntry, deleteDateEntry, addStockItem, transferStock, externalTransfer, receiveStock, categories } = useData();
   const branch = branches.find(b => b.id === id);
   const displayDateEntries = useMemo(() => branch ? getRecalculatedDateEntries(branch) : [], [branch]);
+  const branchSalesSummary = useMemo(() => branch ? getBranchSalesSummary(branch) : null, [branch]);
 
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [newDate, setNewDate] = useState(new Date().toISOString().split('T')[0]);
@@ -233,6 +228,21 @@ export default function BranchPage() {
             </button>
             <h1 className="text-2xl font-bold">{branch.name}</h1>
           </div>
+
+          {currentUser?.role === 'branch' && branchSalesSummary && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="glass-card rounded-xl p-5">
+                <p className="text-xs text-muted-foreground uppercase tracking-wider">Today Sales Count</p>
+                <p className="text-3xl font-bold mt-2 font-mono">{branchSalesSummary.dailySalesCount}</p>
+                <p className="text-xs text-muted-foreground mt-1">{branchSalesSummary.todayKey}</p>
+              </div>
+              <div className="glass-card rounded-xl p-5">
+                <p className="text-xs text-muted-foreground uppercase tracking-wider">Current Month Sales Count</p>
+                <p className="text-3xl font-bold mt-2 font-mono">{branchSalesSummary.monthlySalesCount}</p>
+                <p className="text-xs text-muted-foreground mt-1">{branchSalesSummary.monthKey}</p>
+              </div>
+            </div>
+          )}
 
           <div className="glass-card rounded-xl p-5">
             <div className="flex items-center justify-between mb-4">

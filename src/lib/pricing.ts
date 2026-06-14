@@ -4,6 +4,9 @@ export interface ProductPricing {
   color: string;
   size: string;
   purchasePrice: number;
+  isActive?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 // Static pricing data - can be extended with backend integration later
@@ -72,9 +75,57 @@ export const PRODUCT_PRICING: ProductPricing[] = [
   { id: '52', product: 'DOUBLE DECKOR', color: 'Beige', size: '2', purchasePrice: 4200 },
 ];
 
-export function getPurchasePrice(product: string, color: string, size: string): number {
-  const match = PRODUCT_PRICING.find(
-    p => p.product === product && p.color === color && p.size === size
+export function getPurchasePrice(
+  product: string,
+  color: string,
+  size: string,
+  pricing: ProductPricing[] = PRODUCT_PRICING
+): number {
+  const match = pricing.find(
+    p => p.isActive !== false && p.product === product && p.color === color && p.size === size
   );
   return match?.purchasePrice ?? 0;
+}
+
+export function getSalePurchasePrice(
+  sale: {
+    product: string;
+    color: string;
+    shelfSize: string;
+    purchasePrice?: number;
+    purchasePriceSnapshot?: number;
+  },
+  pricing: ProductPricing[] = PRODUCT_PRICING
+): number {
+  // Sales store a purchasePrice snapshot so later pricing edits do not rewrite old profit.
+  if (typeof sale.purchasePrice === 'number' && Number.isFinite(sale.purchasePrice)) {
+    return sale.purchasePrice;
+  }
+  if (typeof sale.purchasePriceSnapshot === 'number' && Number.isFinite(sale.purchasePriceSnapshot)) {
+    return sale.purchasePriceSnapshot;
+  }
+  return getPurchasePrice(sale.product, sale.color, sale.shelfSize, pricing);
+}
+
+export function createSalePurchasePriceSnapshot(
+  sale: { product: string; color: string; shelfSize: string },
+  pricing: ProductPricing[] = PRODUCT_PRICING,
+  lockedAt = new Date().toISOString()
+) {
+  const currentPurchasePrice = getPurchasePrice(sale.product, sale.color, sale.shelfSize || '', pricing);
+  return {
+    purchasePrice: currentPurchasePrice,
+    purchasePriceSnapshot: currentPurchasePrice,
+    purchasePriceSource: 'pricing_table' as const,
+    purchasePriceLockedAt: lockedAt,
+  };
+}
+
+export function createSeedPricing(now = new Date().toISOString()): ProductPricing[] {
+  return PRODUCT_PRICING.map(item => ({
+    ...item,
+    isActive: true,
+    createdAt: now,
+    updatedAt: now,
+  }));
 }

@@ -18,6 +18,10 @@ export interface SalesEntry {
   shelfSize: string;
   quantity: number;
   price: number;
+  purchasePrice?: number;
+  purchasePriceSnapshot?: number;
+  purchasePriceSource?: 'pricing_table' | 'fallback';
+  purchasePriceLockedAt?: string;
   driverCharge: number;
   collection: number;
   branchId: string;

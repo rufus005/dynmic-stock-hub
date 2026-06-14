@@ -1,9 +1,10 @@
 import { createContext, useContext, useState, useEffect, ReactNode, useCallback, useRef } from 'react';
 import { Branch, SalesEntry, StockItem, ProductionRecord, TransferRecord, DynamicCategory, CATEGORIES } from '@/lib/types';
 import * as store from '@/lib/store';
-import { db, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH, CATEGORIES_PATH, TAGS_PATH } from '@/lib/firebase';
+import { db, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH, CATEGORIES_PATH, TAGS_PATH, PRODUCT_PRICING_PATH } from '@/lib/firebase';
 import { ref, onValue, push } from 'firebase/database';
 import { safeSetPath, safeSoftDeletePath, safeUpdatePaths } from '@/lib/firebaseProtection';
+import { ProductPricing, createSeedPricing, createSalePurchasePriceSnapshot } from '@/lib/pricing';
 
 interface DataContextType {
   branches: Branch[];
@@ -11,6 +12,7 @@ interface DataContextType {
   transferHistory: TransferRecord[];
   categories: DynamicCategory[];
   availableTags: { id: string; name: string }[];
+  productPricing: ProductPricing[];
   addBranch: (name: string) => void;
   updateBranchName: (id: string, name: string) => void;
   removeBranch: (id: string) => void;
@@ -37,6 +39,9 @@ interface DataContextType {
   addTag: (name: string) => void;
   updateTag: (id: string, name: string) => void;
   deleteTag: (id: string) => void;
+  addProductPricing: (price: Omit<ProductPricing, 'id' | 'isActive' | 'createdAt' | 'updatedAt'>) => void;
+  updateProductPricing: (id: string, updates: Partial<Pick<ProductPricing, 'product' | 'color' | 'size' | 'purchasePrice' | 'isActive'>>) => void;
+  disableProductPricing: (id: string) => void;
   refresh: () => Promise<void>;
 }
 
@@ -44,6 +49,13 @@ function isVisibleSnapshotValue(value: unknown): boolean {
   if (!value) return false;
   if (typeof value !== 'object') return true;
   return (value as { deleted?: boolean }).deleted !== true;
+}
+
+function sortProductPricing(a: ProductPricing, b: ProductPricing): number {
+  const aNumber = Number(a.id);
+  const bNumber = Number(b.id);
+  if (Number.isFinite(aNumber) && Number.isFinite(bNumber) && aNumber !== bNumber) return aNumber - bNumber;
+  return a.product.localeCompare(b.product) || a.color.localeCompare(b.color) || a.size.localeCompare(b.size) || a.id.localeCompare(b.id);
 }
 
 const DataContext = createContext<DataContextType | null>(null);
@@ -54,8 +66,10 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [transferHistory, setTransferHistory] = useState<TransferRecord[]>([]);
   const [categories, setCategories] = useState<DynamicCategory[]>([]);
   const [availableTags, setAvailableTags] = useState<{ id: string; name: string }[]>([]);
+  const [productPricing, setProductPricing] = useState<ProductPricing[]>([]);
   const initializedRef = useRef(false);
   const categoriesSeededRef = useRef(false);
+  const pricingSeededRef = useRef(false);
 
   // Real-time Firebase listener for branches
   useEffect(() => {
@@ -98,6 +112,32 @@ export function DataProvider({ children }: { children: ReactNode }) {
       setBranches(result);
     }, (error) => {
       console.error('Firebase read failed:', error);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Real-time listener for dynamic product pricing. Seeds once only when /product_pricing is absent.
+  useEffect(() => {
+    const pricingRef = ref(db, PRODUCT_PRICING_PATH);
+    const unsubscribe = onValue(pricingRef, (snapshot) => {
+      const data = snapshot.val();
+      if (!data) {
+        if (!pricingSeededRef.current) {
+          pricingSeededRef.current = true;
+          const seedPrices = createSeedPricing();
+          safeUpdatePaths(
+            seedPrices.reduce((acc, price) => {
+              acc[`${PRODUCT_PRICING_PATH}/${price.id}`] = price;
+              return acc;
+            }, {} as Record<string, ProductPricing>),
+            { action: 'update', entity: 'product_pricing', reason: 'seed default product pricing' }
+          );
+          setProductPricing(seedPrices);
+        }
+        return;
+      }
+      const prices = Object.values(data as Record<string, unknown>) as ProductPricing[];
+      setProductPricing(prices.sort(sortProductPricing));
     });
     return () => unsubscribe();
   }, []);
@@ -222,11 +262,17 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const deleteStockItemFn = useCallback((branchId: string, date: string, stockId: string) => setBranches(store.deleteStockItem(branchId, date, stockId)), []);
 
   const addSaleFn = useCallback((branchId: string, date: string, sale: Omit<SalesEntry, 'id' | 'branchId' | 'collection'>) => {
-    return store.addSaleAndRefetch(branchId, date, sale).then(updatedBranches => {
+    // Snapshot current purchase price at sale time so future pricing edits do not change old sale profit.
+    const pricingForSnapshot = productPricing.length > 0 ? productPricing : undefined;
+    const saleWithPriceSnapshot = {
+      ...sale,
+      ...createSalePurchasePriceSnapshot(sale, pricingForSnapshot),
+    };
+    return store.addSaleAndRefetch(branchId, date, saleWithPriceSnapshot).then(updatedBranches => {
       setBranches(updatedBranches);
       return updatedBranches;
     });
-  }, []);
+  }, [productPricing]);
   const updateSaleFn = useCallback((branchId: string, date: string, saleId: string, updates: Partial<SalesEntry>) => {
     return store.updateSaleAndRefetch(branchId, date, saleId, updates).then(updatedBranches => {
       setBranches(updatedBranches);
@@ -343,6 +389,23 @@ export function DataProvider({ children }: { children: ReactNode }) {
     safeSoftDeletePath(`${TAGS_PATH}/${id}`, { entity: 'tags', reason: 'tag soft delete' });
   }, []);
 
+  const addProductPricingFn = useCallback((price: Omit<ProductPricing, 'id' | 'isActive' | 'createdAt' | 'updatedAt'>) => {
+    const now = new Date().toISOString();
+    const newRef = push(ref(db, PRODUCT_PRICING_PATH));
+    const id = newRef.key || crypto.randomUUID();
+    safeSetPath(`${PRODUCT_PRICING_PATH}/${id}`, { ...price, id, isActive: true, createdAt: now, updatedAt: now }, { action: 'set', entity: 'product_pricing', reason: 'create product price' });
+  }, []);
+
+  const updateProductPricingFn = useCallback((id: string, updates: Partial<Pick<ProductPricing, 'product' | 'color' | 'size' | 'purchasePrice' | 'isActive'>>) => {
+    const current = productPricing.find(p => p.id === id);
+    if (!current) return;
+    safeSetPath(`${PRODUCT_PRICING_PATH}/${id}`, { ...current, ...updates, updatedAt: new Date().toISOString() }, { action: 'set', entity: 'product_pricing', reason: 'update product price' });
+  }, [productPricing]);
+
+  const disableProductPricingFn = useCallback((id: string) => {
+    updateProductPricingFn(id, { isActive: false });
+  }, [updateProductPricingFn]);
+
   return (
     <DataContext.Provider
       value={{
@@ -351,6 +414,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
         transferHistory,
         categories,
         availableTags,
+        productPricing,
         addBranch,
         updateBranchName,
         removeBranch,
@@ -377,6 +441,9 @@ export function DataProvider({ children }: { children: ReactNode }) {
         addTag: addTagFn,
         updateTag: updateTagFn,
         deleteTag: deleteTagFn,
+        addProductPricing: addProductPricingFn,
+        updateProductPricing: updateProductPricingFn,
+        disableProductPricing: disableProductPricingFn,
         refresh,
       }}
     >

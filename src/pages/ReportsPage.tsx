@@ -5,7 +5,7 @@ import AppLayout from '@/components/AppLayout';
 import { Download, Filter, Share2 } from 'lucide-react';
 import jsPDF from 'jspdf';
 import { autoTable } from 'jspdf-autotable';
-import { PRODUCT_PRICING, getPurchasePrice } from '@/lib/pricing';
+import { getPurchasePrice, getSalePurchasePrice } from '@/lib/pricing';
 import { toast } from 'sonner';
 
 declare module 'jspdf' {
@@ -27,7 +27,7 @@ type StockReportRow = {
 };
 
 export default function ReportsPage() {
-  const { branches, productionHistory, transferHistory, categories } = useData();
+  const { branches, productionHistory, transferHistory, categories, productPricing } = useData();
   const [reportType, setReportType] = useState<ReportType>('sales');
   const [dateFilter, setDateFilter] = useState<'all' | 'today' | 'yesterday' | 'weekly' | 'monthly' | 'custom'>('today');
   const [customFrom, setCustomFrom] = useState<string>('');
@@ -88,9 +88,9 @@ export default function ReportsPage() {
   const availableSizes = useMemo(() => {
     if (productFilter === 'all') return [];
     const sizes = new Set<string>();
-    PRODUCT_PRICING.filter(p => p.product === productFilter).forEach(p => sizes.add(p.size));
+    productPricing.filter(p => p.isActive !== false && p.product === productFilter).forEach(p => sizes.add(p.size));
     return Array.from(sizes).sort((a, b) => Number(b) - Number(a));
-  }, [productFilter]);
+  }, [productFilter, productPricing]);
 
   const filteredSales = useMemo(() => {
     let sales = [...allSales];
@@ -137,9 +137,9 @@ export default function ReportsPage() {
   const totalQtySold = filteredSales.reduce((s, sale) => s + sale.quantity, 0);
   const totalCollection = filteredSales.reduce((s, sale) => s + sale.collection, 0);
   const totalDriverCharges = filteredSales.reduce((s, sale) => s + sale.driverCharge, 0);
-  const totalPurchasePrice = filteredSales.reduce((s, sale) => s + getPurchasePrice(sale.product, sale.color, sale.shelfSize) * sale.quantity, 0);
+  const totalPurchasePrice = filteredSales.reduce((s, sale) => s + getSalePurchasePrice(sale, productPricing) * sale.quantity, 0);
   const totalProfit = filteredSales.reduce((s, sale) => {
-    const pp = getPurchasePrice(sale.product, sale.color, sale.shelfSize);
+    const pp = getSalePurchasePrice(sale, productPricing);
     return s + (sale.price - pp * sale.quantity);
   }, 0);
 
@@ -187,7 +187,7 @@ export default function ReportsPage() {
   }, [branches, branchFilter, productFilter, sizeFilter, dateFilter, customFrom, customTo]);
 
   const stockTotalQty = stockData.reduce((acc, s) => acc + s.quantity, 0);
-  const stockTotalValue = stockData.reduce((acc, s) => acc + getPurchasePrice(s.category, s.color, s.shelfSize) * s.quantity, 0);
+  const stockTotalValue = stockData.reduce((acc, s) => acc + getPurchasePrice(s.category, s.color, s.shelfSize, productPricing) * s.quantity, 0);
   const stockBranchCount = new Set(stockData.map(s => s.branchId)).size;
   const stockDateCount = new Set(stockData.map(s => s.date)).size;
   const summaryCards = reportType === 'stock'
@@ -360,7 +360,7 @@ export default function ReportsPage() {
         ...commonTableOptions,
         head: [['Date', 'Branch', 'Product', 'Shelf Size', 'Color', 'Payment', 'Qty Sold', 'Collection', 'Driver Charges', 'Purchase Price', 'Profit']],
         body: filteredSales.map(s => {
-          const pp = getPurchasePrice(s.product, s.color, s.shelfSize);
+          const pp = getSalePurchasePrice(s, productPricing);
           const profit = s.price - pp * s.quantity;
           return [
             s.date,
@@ -396,7 +396,7 @@ export default function ReportsPage() {
         head: [['Branch', 'Category', 'Shelf Size', 'Color', 'Quantity', 'Purchase Price (Rs.)', 'Total Value (Rs.)']],
         body: [
           ...stockData.map(s => {
-            const pp = getPurchasePrice(s.category, s.color, s.shelfSize);
+            const pp = getPurchasePrice(s.category, s.color, s.shelfSize, productPricing);
             return [s.branch, s.category, s.shelfSize, s.color, s.quantity.toString(), formatPdfCurrency(pp), formatPdfCurrency(pp * s.quantity)];
           }),
           ['', '', '', 'Grand Total', stockTotalQty.toString(), '', formatPdfCurrency(stockTotalValue)],
@@ -622,7 +622,7 @@ export default function ReportsPage() {
                 </thead>
                 <tbody>
                   {filteredSales.map(s => {
-                    const pp = getPurchasePrice(s.product, s.color, s.shelfSize);
+                    const pp = getSalePurchasePrice(s, productPricing);
                     const profit = s.price - pp * s.quantity;
                     return (
                       <tr key={s.id} className="border-b border-border/30 hover:bg-muted/20">
@@ -672,7 +672,7 @@ export default function ReportsPage() {
                 </thead>
                 <tbody>
                   {stockData.map((s, i) => {
-                    const pp = getPurchasePrice(s.category, s.color, s.shelfSize);
+                    const pp = getPurchasePrice(s.category, s.color, s.shelfSize, productPricing);
                     const total = pp * s.quantity;
                     return (
                       <tr key={i} className="border-b border-border/30 hover:bg-muted/20">

@@ -4,15 +4,15 @@ import { useData } from '@/contexts/DataContext';
 import { useAuth } from '@/contexts/AuthContext';
 import { DynamicCategory, UserAccount } from '@/lib/types';
 import { getOverallStock, getAllSales, getBranchTotalStock, getBranchTotalSales, getLatestDateEntry } from '@/lib/store';
-import { getPurchasePrice } from '@/lib/pricing';
+import { ProductPricing, getPurchasePrice } from '@/lib/pricing';
 import { motion } from 'framer-motion';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from 'recharts';
-import { Package, TrendingUp, Store, ArrowRight, Plus, Pencil, Trash2, X, Check, Users, Shield, Building2, Tag, Layers, Filter, Wallet, ChevronDown, ChevronUp } from 'lucide-react';
+import { Package, TrendingUp, Store, ArrowRight, Plus, Pencil, Trash2, X, Check, Users, Shield, Building2, Tag, Layers, Filter, Wallet, ChevronDown, ChevronUp, IndianRupee } from 'lucide-react';
 import AppLayout from '@/components/AppLayout';
 import { toast } from 'sonner';
 
 export default function DashboardPage() {
-  const { branches, categories, availableTags, productionHistory, addBranch, updateBranchName, removeBranch, addCategory, updateCategory, deleteCategory, addTag, updateTag, deleteTag } = useData();
+  const { branches, categories, availableTags, productPricing, productionHistory, addBranch, updateBranchName, removeBranch, addCategory, updateCategory, deleteCategory, addTag, updateTag, deleteTag, addProductPricing, updateProductPricing, disableProductPricing } = useData();
   const { users, addUser, updateUser, deleteUser } = useAuth();
   const [newBranchName, setNewBranchName] = useState('');
   const [showAdd, setShowAdd] = useState(false);
@@ -36,6 +36,11 @@ export default function DashboardPage() {
   const [showTagForm, setShowTagForm] = useState(false);
   const [editingTagId, setEditingTagId] = useState<string | null>(null);
   const [tagName, setTagName] = useState('');
+
+  // Product pricing management state
+  const [showPricingForm, setShowPricingForm] = useState(false);
+  const [editingPricingId, setEditingPricingId] = useState<string | null>(null);
+  const [pricingForm, setPricingForm] = useState({ product: '', color: '', size: '', purchasePrice: '0' });
 
   const dashboardBranches = useMemo(
     () => dashboardBranchFilter === 'all'
@@ -126,11 +131,11 @@ export default function DashboardPage() {
       const latest = getLatestDateEntry(branch);
       if (!latest) continue;
       for (const item of latest.stock) {
-        value += item.quantity * getPurchasePrice(item.category, item.color, item.shelfSize || '');
+        value += item.quantity * getPurchasePrice(item.category, item.color, item.shelfSize || '', productPricing);
       }
     }
     return value;
-  }, [dashboardBranches]);
+  }, [dashboardBranches, productPricing]);
 
   const reportsCalculatedStock = useMemo(() => {
     return dashboardBranches.reduce((total, branch) => {
@@ -211,11 +216,11 @@ export default function DashboardPage() {
     return Array.from(map.values())
       .map(r => {
         const current = r.purchased - r.sold;
-        const price = getPurchasePrice(r.product, r.color, r.size);
+        const price = getPurchasePrice(r.product, r.color, r.size, productPricing);
         return { ...r, currentStock: current, stockValue: current * price, purchasePrice: price };
       })
       .sort((a, b) => a.product.localeCompare(b.product) || a.size.localeCompare(b.size) || a.color.localeCompare(b.color));
-  }, [productionHistory, dashboardBranches, dashboardBranchFilter, sumProduct, sumSize, sumFromDate, sumToDate]);
+  }, [productionHistory, dashboardBranches, dashboardBranchFilter, sumProduct, sumSize, sumFromDate, sumToDate, productPricing]);
 
   const summaryTotals = useMemo(() => {
     return summaryRows.reduce(
@@ -342,6 +347,58 @@ export default function DashboardPage() {
     }
     setTagName('');
     setShowTagForm(false);
+  };
+
+  const resetPricingForm = () => {
+    setPricingForm({ product: '', color: '', size: '', purchasePrice: '0' });
+    setEditingPricingId(null);
+    setShowPricingForm(false);
+  };
+
+  const handleSavePricing = () => {
+    const product = pricingForm.product.trim();
+    const color = pricingForm.color.trim();
+    const size = pricingForm.size.trim();
+    const purchasePrice = Number(pricingForm.purchasePrice);
+    if (!product || !color || !size) {
+      toast.error('Product, color, and size are required');
+      return;
+    }
+    if (!Number.isFinite(purchasePrice) || purchasePrice < 0) {
+      toast.error('Purchase price must be a valid number');
+      return;
+    }
+    if (editingPricingId) {
+      updateProductPricing(editingPricingId, { product, color, size, purchasePrice, isActive: true });
+      toast.success('Product price updated');
+    } else {
+      addProductPricing({ product, color, size, purchasePrice });
+      toast.success('Product price created');
+    }
+    resetPricingForm();
+  };
+
+  const handleEditPricing = (price: ProductPricing) => {
+    setEditingPricingId(price.id);
+    setPricingForm({
+      product: price.product,
+      color: price.color,
+      size: price.size,
+      purchasePrice: String(price.purchasePrice),
+    });
+    setShowPricingForm(true);
+  };
+
+  const handleDisablePricing = (id: string) => {
+    if (confirm('Disable this product price? Future missing price lookup will use ₹0.')) {
+      disableProductPricing(id);
+      toast.success('Product price disabled');
+    }
+  };
+
+  const handleReactivatePricing = (id: string) => {
+    updateProductPricing(id, { isActive: true });
+    toast.success('Product price reactivated');
   };
 
   return (
@@ -583,6 +640,94 @@ export default function DashboardPage() {
             </table>
           </div>
           </>)}
+        </div>
+
+        {/* Product Pricing */}
+        <div className="glass-card rounded-xl p-5">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-semibold flex items-center gap-2"><IndianRupee className="w-5 h-5 text-primary" /> Product Pricing ({productPricing.length})</h3>
+            <button onClick={() => { setShowPricingForm(true); setEditingPricingId(null); setPricingForm({ product: '', color: '', size: '', purchasePrice: '0' }); }}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg gradient-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity">
+              <Plus className="w-4 h-4" /> Add Price
+            </button>
+          </div>
+
+          {showPricingForm && (
+            <div className="p-4 rounded-xl bg-muted/30 border border-border/50 mb-4 space-y-3">
+              <h4 className="font-medium text-sm">{editingPricingId ? 'Edit Product Price' : 'New Product Price'}</h4>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+                <div>
+                  <label className="text-xs text-muted-foreground font-medium">Product</label>
+                  <input value={pricingForm.product} onChange={e => setPricingForm(p => ({ ...p, product: e.target.value }))}
+                    className="w-full mt-1 px-3 py-2 rounded-lg bg-muted/50 border border-border outline-none focus:border-primary text-foreground text-sm" placeholder="e.g. JUMBO" />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground font-medium">Color</label>
+                  <input value={pricingForm.color} onChange={e => setPricingForm(p => ({ ...p, color: e.target.value }))}
+                    className="w-full mt-1 px-3 py-2 rounded-lg bg-muted/50 border border-border outline-none focus:border-primary text-foreground text-sm" placeholder="e.g. Ivory" />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground font-medium">Size</label>
+                  <input value={pricingForm.size} onChange={e => setPricingForm(p => ({ ...p, size: e.target.value }))}
+                    className="w-full mt-1 px-3 py-2 rounded-lg bg-muted/50 border border-border outline-none focus:border-primary text-foreground text-sm" placeholder="e.g. 5" />
+                </div>
+                <div>
+                  <label className="text-xs text-muted-foreground font-medium">Purchase Price</label>
+                  <input type="number" min="0" value={pricingForm.purchasePrice} onChange={e => setPricingForm(p => ({ ...p, purchasePrice: e.target.value }))}
+                    className="w-full mt-1 px-3 py-2 rounded-lg bg-muted/50 border border-border outline-none focus:border-primary text-foreground text-sm" />
+                </div>
+              </div>
+              <div className="flex gap-2">
+                <button onClick={handleSavePricing} className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-success text-success-foreground text-sm font-medium">
+                  <Check className="w-4 h-4" /> {editingPricingId ? 'Update' : 'Create'}
+                </button>
+                <button onClick={resetPricingForm} className="px-4 py-2 rounded-lg bg-muted text-muted-foreground text-sm font-medium">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-border">
+                  {['Product', 'Color', 'Size', 'Purchase Price', 'Status', 'Updated', 'Actions'].map(h => (
+                    <th key={h} className="text-left py-2 px-3 text-muted-foreground font-medium whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {productPricing.map(price => (
+                  <tr key={price.id} className="border-b border-border/40 hover:bg-muted/20">
+                    <td className="py-2 px-3 font-medium">{price.product}</td>
+                    <td className="py-2 px-3">{price.color}</td>
+                    <td className="py-2 px-3">{price.size}</td>
+                    <td className="py-2 px-3 font-mono">₹{price.purchasePrice.toLocaleString()}</td>
+                    <td className="py-2 px-3">
+                      <span className={`px-2 py-1 rounded-full text-xs ${price.isActive === false ? 'bg-muted text-muted-foreground' : 'bg-success/15 text-success'}`}>
+                        {price.isActive === false ? 'Inactive' : 'Active'}
+                      </span>
+                    </td>
+                    <td className="py-2 px-3 text-muted-foreground">{price.updatedAt ? new Date(price.updatedAt).toLocaleDateString('en-IN') : '-'}</td>
+                    <td className="py-2 px-3">
+                      <div className="flex items-center gap-1">
+                        <button onClick={() => handleEditPricing(price)} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground"><Pencil className="w-3.5 h-3.5" /></button>
+                        {price.isActive === false ? (
+                          <button onClick={() => handleReactivatePricing(price.id)} className="px-2 py-1 rounded-md bg-success/15 text-success text-xs font-medium">Activate</button>
+                        ) : (
+                          <button onClick={() => handleDisablePricing(price.id)} className="p-1.5 rounded-lg hover:bg-destructive/10 text-destructive"><Trash2 className="w-3.5 h-3.5" /></button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+                {productPricing.length === 0 && (
+                  <tr><td colSpan={7} className="py-8 text-center text-muted-foreground">Product pricing is loading or not seeded yet.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
 
         {/* Categories Management */}
