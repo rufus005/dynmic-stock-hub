@@ -5,6 +5,7 @@ import { useAuth } from '@/contexts/AuthContext';
 import { Branch, StockItem, SalesEntry, DynamicCategory } from '@/lib/types';
 import { getRecalculatedDateEntries, getStockAuditRows, type StockAuditResult } from '@/lib/store';
 import { getBranchSalesSummary, getLocalDateString } from '@/lib/branchSalesSummary';
+import { getBranchStockSnapshot } from '@/lib/branchStockView';
 import { motion } from 'framer-motion';
 import { ArrowLeft, Save, Plus, Trash2, Pencil, Check, X, Calendar, ChevronRight, ChevronDown, Tag } from 'lucide-react';
 import AppLayout from '@/components/AppLayout';
@@ -64,8 +65,16 @@ export default function BranchPage() {
   const [selectedDate, setSelectedDate] = useState<string | null>(null);
   const [newDate, setNewDate] = useState(new Date().toISOString().split('T')[0]);
   const [showAddDate, setShowAddDate] = useState(false);
+  const [showOtherBranchStock, setShowOtherBranchStock] = useState(false);
+  const [otherBranchId, setOtherBranchId] = useState('');
   const [expandedMonths, setExpandedMonths] = useState<Set<string>>(new Set());
   const autoCreatedDatesRef = useRef<Set<string>>(new Set());
+
+  const selectedOtherBranch = branches.find(item => item.id === otherBranchId) || null;
+  const otherBranchStockSnapshot = useMemo(
+    () => selectedOtherBranch ? getBranchStockSnapshot(selectedOtherBranch, getLocalDateString()) : null,
+    [selectedOtherBranch]
+  );
 
   const dateEntryGroups = useMemo(() => {
     if (!branch) return [];
@@ -222,11 +231,24 @@ export default function BranchPage() {
     return (
       <AppLayout>
         <div className="space-y-6">
-          <div className="flex items-center gap-3">
-            <button onClick={() => navigate(currentUser?.role === 'admin' ? '/dashboard' : `/branch/${currentUser?.branchId}`)} className="p-2 rounded-lg hover:bg-muted transition-colors">
-              <ArrowLeft className="w-5 h-5" />
-            </button>
-            <h1 className="text-2xl font-bold">{branch.name}</h1>
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-3">
+              <button onClick={() => navigate(currentUser?.role === 'admin' ? '/dashboard' : `/branch/${currentUser?.branchId}`)} className="p-2 rounded-lg hover:bg-muted transition-colors">
+                <ArrowLeft className="w-5 h-5" />
+              </button>
+              <h1 className="text-2xl font-bold">{branch.name}</h1>
+            </div>
+            {currentUser?.role === 'branch' && (
+              <button
+                type="button"
+                onClick={() => setShowOtherBranchStock(open => !open)}
+                className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${showOtherBranchStock ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground hover:bg-muted/80'}`}
+                aria-expanded={showOtherBranchStock}
+              >
+                Other Branch Stock
+                {showOtherBranchStock ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+              </button>
+            )}
           </div>
 
           {currentUser?.role === 'branch' && branchSalesSummary && (
@@ -241,6 +263,81 @@ export default function BranchPage() {
                 <p className="text-3xl font-bold mt-2 font-mono">{branchSalesSummary.monthlySalesCount}</p>
                 <p className="text-xs text-muted-foreground mt-1">{branchSalesSummary.monthKey}</p>
               </div>
+            </div>
+          )}
+
+          {currentUser?.role === 'branch' && showOtherBranchStock && (
+            <div className="glass-card rounded-xl p-5">
+              <div className="flex items-center justify-between gap-3 flex-wrap mb-4">
+                <div>
+                  <h2 className="font-semibold text-lg">Other Branch Stock</h2>
+                  <p className="text-xs text-muted-foreground mt-1">Read-only stock report from existing branch entries.</p>
+                </div>
+                {otherBranchStockSnapshot && (
+                  <p className="text-sm text-muted-foreground">
+                    Stock as on <span className="font-mono text-foreground">{otherBranchStockSnapshot.date}</span>
+                  </p>
+                )}
+              </div>
+
+              <div className="max-w-sm mb-4">
+                <label className="text-xs text-muted-foreground font-medium">Select Branch</label>
+                <select
+                  value={otherBranchId}
+                  onChange={e => setOtherBranchId(e.target.value)}
+                  className="w-full mt-1 px-3 py-2 rounded-lg bg-muted/50 border border-border outline-none focus:border-primary text-foreground text-sm"
+                >
+                  <option value="">Select branch</option>
+                  {branches.map(item => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}{item.id === branch.id ? ' (Current branch)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {!selectedOtherBranch && (
+                <p className="text-sm text-muted-foreground text-center py-8">Select a branch to view current stock.</p>
+              )}
+
+              {selectedOtherBranch && !otherBranchStockSnapshot && (
+                <p className="text-sm text-muted-foreground text-center py-8">No stock entries found for {selectedOtherBranch.name}.</p>
+              )}
+
+              {otherBranchStockSnapshot && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-border">
+                        {['Product', 'Color', 'Size', 'Current Stock'].map(header => (
+                          <th key={header} className="text-left py-2 px-3 text-muted-foreground font-medium whitespace-nowrap">{header}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {otherBranchStockSnapshot.rows.map(row => (
+                        <tr key={row.id} className="border-b border-border/30 hover:bg-muted/20">
+                          <td className="py-2 px-3 font-medium">{row.product}</td>
+                          <td className="py-2 px-3">{row.color}</td>
+                          <td className="py-2 px-3">{row.size}</td>
+                          <td className="py-2 px-3 font-mono font-semibold">{row.currentStock}</td>
+                        </tr>
+                      ))}
+                      {otherBranchStockSnapshot.rows.length === 0 && (
+                        <tr><td colSpan={4} className="py-8 text-center text-muted-foreground">No stock items found for this date.</td></tr>
+                      )}
+                    </tbody>
+                    {otherBranchStockSnapshot.rows.length > 0 && (
+                      <tfoot>
+                        <tr className="border-t-2 border-border bg-muted/30">
+                          <td className="py-2 px-3 font-semibold" colSpan={3}>Total</td>
+                          <td className="py-2 px-3 font-mono font-bold">{otherBranchStockSnapshot.totalStock}</td>
+                        </tr>
+                      </tfoot>
+                    )}
+                  </table>
+                </div>
+              )}
             </div>
           )}
 
