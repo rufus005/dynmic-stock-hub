@@ -38,6 +38,7 @@ export default function DashboardPage() {
   const [tagName, setTagName] = useState('');
 
   // Product pricing management state
+  const [pricingOpen, setPricingOpen] = useState(false);
   const [showPricingForm, setShowPricingForm] = useState(false);
   const [editingPricingId, setEditingPricingId] = useState<string | null>(null);
   const [pricingForm, setPricingForm] = useState({ product: '', color: '', size: '', purchasePrice: '0' });
@@ -644,16 +645,23 @@ export default function DashboardPage() {
 
         {/* Product Pricing */}
         <div className="glass-card rounded-xl p-5">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="font-semibold flex items-center gap-2"><IndianRupee className="w-5 h-5 text-primary" /> Product Pricing ({productPricing.length})</h3>
-            <button onClick={() => { setShowPricingForm(true); setEditingPricingId(null); setPricingForm({ product: '', color: '', size: '', purchasePrice: '0' }); }}
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <button
+              onClick={() => setPricingOpen(o => !o)}
+              className="flex items-center justify-between gap-2 flex-1 text-left"
+              aria-expanded={pricingOpen}
+            >
+              <h3 className="font-semibold flex items-center gap-2"><IndianRupee className="w-5 h-5 text-primary" /> Product Pricing ({productPricing.length})</h3>
+              {pricingOpen ? <ChevronUp className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
+            </button>
+            <button onClick={() => { setPricingOpen(true); setShowPricingForm(true); setEditingPricingId(null); setPricingForm({ product: '', color: '', size: '', purchasePrice: '0' }); }}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg gradient-primary text-primary-foreground text-sm font-medium hover:opacity-90 transition-opacity">
               <Plus className="w-4 h-4" /> Add Price
             </button>
           </div>
 
-          {showPricingForm && (
-            <div className="p-4 rounded-xl bg-muted/30 border border-border/50 mb-4 space-y-3">
+          {pricingOpen && showPricingForm && (
+            <div className="p-4 rounded-xl bg-muted/30 border border-border/50 mt-4 mb-4 space-y-3">
               <h4 className="font-medium text-sm">{editingPricingId ? 'Edit Product Price' : 'New Product Price'}</h4>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                 <div>
@@ -688,46 +696,48 @@ export default function DashboardPage() {
             </div>
           )}
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b border-border">
-                  {['Product', 'Color', 'Size', 'Purchase Price', 'Status', 'Updated', 'Actions'].map(h => (
-                    <th key={h} className="text-left py-2 px-3 text-muted-foreground font-medium whitespace-nowrap">{h}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {productPricing.map(price => (
-                  <tr key={price.id} className="border-b border-border/40 hover:bg-muted/20">
-                    <td className="py-2 px-3 font-medium">{price.product}</td>
-                    <td className="py-2 px-3">{price.color}</td>
-                    <td className="py-2 px-3">{price.size}</td>
-                    <td className="py-2 px-3 font-mono">₹{price.purchasePrice.toLocaleString()}</td>
-                    <td className="py-2 px-3">
-                      <span className={`px-2 py-1 rounded-full text-xs ${price.isActive === false ? 'bg-muted text-muted-foreground' : 'bg-success/15 text-success'}`}>
-                        {price.isActive === false ? 'Inactive' : 'Active'}
-                      </span>
-                    </td>
-                    <td className="py-2 px-3 text-muted-foreground">{price.updatedAt ? new Date(price.updatedAt).toLocaleDateString('en-IN') : '-'}</td>
-                    <td className="py-2 px-3">
-                      <div className="flex items-center gap-1">
-                        <button onClick={() => handleEditPricing(price)} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground"><Pencil className="w-3.5 h-3.5" /></button>
-                        {price.isActive === false ? (
-                          <button onClick={() => handleReactivatePricing(price.id)} className="px-2 py-1 rounded-md bg-success/15 text-success text-xs font-medium">Activate</button>
-                        ) : (
-                          <button onClick={() => handleDisablePricing(price.id)} className="p-1.5 rounded-lg hover:bg-destructive/10 text-destructive"><Trash2 className="w-3.5 h-3.5" /></button>
-                        )}
-                      </div>
-                    </td>
+          {pricingOpen && (
+            <div className="overflow-x-auto mt-4">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b border-border">
+                    {['Product', 'Color', 'Size', 'Purchase Price', 'Status', 'Updated', 'Actions'].map(h => (
+                      <th key={h} className="text-left py-2 px-3 text-muted-foreground font-medium whitespace-nowrap">{h}</th>
+                    ))}
                   </tr>
-                ))}
-                {productPricing.length === 0 && (
-                  <tr><td colSpan={7} className="py-8 text-center text-muted-foreground">Product pricing is loading or not seeded yet.</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {productPricing.map(price => (
+                    <tr key={price.id} className="border-b border-border/40 hover:bg-muted/20">
+                      <td className="py-2 px-3 font-medium">{price.product}</td>
+                      <td className="py-2 px-3">{price.color}</td>
+                      <td className="py-2 px-3">{price.size}</td>
+                      <td className="py-2 px-3 font-mono">₹{price.purchasePrice.toLocaleString()}</td>
+                      <td className="py-2 px-3">
+                        <span className={`px-2 py-1 rounded-full text-xs ${price.isActive === false ? 'bg-muted text-muted-foreground' : 'bg-success/15 text-success'}`}>
+                          {price.isActive === false ? 'Inactive' : 'Active'}
+                        </span>
+                      </td>
+                      <td className="py-2 px-3 text-muted-foreground">{price.updatedAt ? new Date(price.updatedAt).toLocaleDateString('en-IN') : '-'}</td>
+                      <td className="py-2 px-3">
+                        <div className="flex items-center gap-1">
+                          <button onClick={() => handleEditPricing(price)} className="p-1.5 rounded-lg hover:bg-muted text-muted-foreground"><Pencil className="w-3.5 h-3.5" /></button>
+                          {price.isActive === false ? (
+                            <button onClick={() => handleReactivatePricing(price.id)} className="px-2 py-1 rounded-md bg-success/15 text-success text-xs font-medium">Activate</button>
+                          ) : (
+                            <button onClick={() => handleDisablePricing(price.id)} className="p-1.5 rounded-lg hover:bg-destructive/10 text-destructive"><Trash2 className="w-3.5 h-3.5" /></button>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                  {productPricing.length === 0 && (
+                    <tr><td colSpan={7} className="py-8 text-center text-muted-foreground">Product pricing is loading or not seeded yet.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
 
         {/* Categories Management */}
