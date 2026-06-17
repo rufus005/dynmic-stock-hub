@@ -142,6 +142,7 @@ export default function ReportsPage() {
     const pp = getSalePurchasePrice(sale, productPricing);
     return s + (sale.price - pp * sale.quantity);
   }, 0);
+  const totalTransferQuantity = filteredTransfers.reduce((sum, record) => sum + record.quantity, 0);
 
   const stockData = useMemo(() => {
     const rawRows: StockReportRow[] = [];
@@ -429,15 +430,18 @@ export default function ReportsPage() {
       autoTable(doc, {
         ...commonTableOptions,
         head: [['Date', 'Type', 'From', 'To', 'Product', 'Size', 'Quantity']],
-        body: filteredTransfers.map(r => [
-          r.date,
-          r.type === 'internal' ? 'Internal' : 'External',
-          r.fromBranchName,
-          r.type === 'external' ? (r.externalName || 'External') : (r.toBranchName || '-'),
-          r.product,
-          r.shelfSize || '-',
-          r.quantity.toString(),
-        ]),
+        body: [
+          ...filteredTransfers.map(r => [
+            r.date,
+            r.type === 'internal' ? 'Internal' : 'External',
+            r.fromBranchName,
+            r.type === 'external' ? (r.externalName || 'External') : (r.toBranchName || '-'),
+            r.product,
+            r.shelfSize || '-',
+            r.quantity.toString(),
+          ]),
+          ['Totals', '', '', '', '', '', totalTransferQuantity.toString()],
+        ],
         columnStyles: { 6: { halign: 'right' } },
       });
     }
@@ -790,6 +794,17 @@ export default function ReportsPage() {
                       <td className="py-2 px-2 font-mono">{r.quantity}</td>
                     </tr>
                   ))}
+                  {filteredTransfers.length > 0 && (
+                    <tr className="border-t border-border bg-muted/30 font-semibold">
+                      <td className="py-2 px-2">Totals</td>
+                      <td className="py-2 px-2"></td>
+                      <td className="py-2 px-2"></td>
+                      <td className="py-2 px-2"></td>
+                      <td className="py-2 px-2"></td>
+                      <td className="py-2 px-2"></td>
+                      <td className="py-2 px-2 font-mono">{totalTransferQuantity}</td>
+                    </tr>
+                  )}
                   {filteredTransfers.length === 0 && (
                     <tr><td colSpan={7} className="py-8 text-center text-muted-foreground">No transfer history found</td></tr>
                   )}
