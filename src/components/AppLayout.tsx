@@ -2,7 +2,7 @@ import { ReactNode } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '@/contexts/AuthContext';
 import { useData } from '@/contexts/DataContext';
-import { LayoutDashboard, FileText, LogOut, Moon, Sun, Store } from 'lucide-react';
+import { LayoutDashboard, FileText, LogOut, Moon, Sun, Settings, Store } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import { toast } from 'sonner';
 
@@ -35,9 +35,10 @@ export default function AppLayout({ children, title }: AppLayoutProps) {
     : null;
 
   const navItems = isAdmin
-    ? [
+      ? [
         { path: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
         { path: '/reports', label: 'Reports', icon: FileText },
+        { path: '/settings', label: 'Settings', icon: Settings },
       ]
     : [
         { path: `/branch/${currentUser?.branchId}`, label: branchName || 'My Branch', icon: Store },

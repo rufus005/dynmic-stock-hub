@@ -22,3 +22,6 @@ export const TAGS_PATH = 'tags';
 export const PRODUCT_PRICING_PATH = 'product_pricing';
 export const AUDIT_LOGS_PATH = 'audit_logs';
 export const BACKUPS_PATH = 'backups';
+export const ADMIN_SETTINGS_PATH = 'admin_settings';
+export const DAILY_EMAIL_REPORT_SETTINGS_PATH = `${ADMIN_SETTINGS_PATH}/daily_email_report`;
+export const EMAIL_REPORT_LOGS_PATH = 'email_report_logs';

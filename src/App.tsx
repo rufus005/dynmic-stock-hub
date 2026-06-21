@@ -7,6 +7,7 @@ import LoginPage from "@/pages/LoginPage";
 import DashboardPage from "@/pages/DashboardPage";
 import BranchPage from "@/pages/BranchPage";
 import ReportsPage from "@/pages/ReportsPage";
+import AdminSettingsPage from "@/pages/AdminSettingsPage";
 import { Toaster } from "sonner";
 
 const queryClient = new QueryClient();
@@ -36,6 +37,7 @@ const AppRoutes = () => {
       <Route path="/dashboard" element={<ProtectedRoute requiredRole="admin"><DashboardPage /></ProtectedRoute>} />
       <Route path="/branch/:id" element={<ProtectedRoute><BranchPage /></ProtectedRoute>} />
       <Route path="/reports" element={<ProtectedRoute requiredRole="admin"><ReportsPage /></ProtectedRoute>} />
+      <Route path="/settings" element={<ProtectedRoute requiredRole="admin"><AdminSettingsPage /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

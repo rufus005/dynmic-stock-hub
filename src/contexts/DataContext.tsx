@@ -1,7 +1,7 @@
 import { createContext, useContext, useState, useEffect, ReactNode, useCallback, useRef } from 'react';
 import { Branch, SalesEntry, StockItem, ProductionRecord, TransferRecord, DynamicCategory, CATEGORIES } from '@/lib/types';
 import * as store from '@/lib/store';
-import { db, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH, CATEGORIES_PATH, TAGS_PATH, PRODUCT_PRICING_PATH } from '@/lib/firebase';
+import { db, PRODUCTS_PATH, PRODUCTION_HISTORY_PATH, TRANSFER_HISTORY_PATH, CATEGORIES_PATH, TAGS_PATH, PRODUCT_PRICING_PATH, DAILY_EMAIL_REPORT_SETTINGS_PATH } from '@/lib/firebase';
 import { ref, onValue, push } from 'firebase/database';
 import { safeSetPath, safeSoftDeletePath, safeUpdatePaths } from '@/lib/firebaseProtection';
 import { ProductPricing, createSeedPricing, createSalePurchasePriceSnapshot } from '@/lib/pricing';
@@ -13,6 +13,8 @@ interface DataContextType {
   categories: DynamicCategory[];
   availableTags: { id: string; name: string }[];
   productPricing: ProductPricing[];
+  dailyEmailRecipients: string[];
+  updateDailyEmailRecipients: (recipients: string[]) => Promise<void>;
   addBranch: (name: string) => void;
   updateBranchName: (id: string, name: string) => void;
   removeBranch: (id: string) => void;
@@ -60,6 +62,8 @@ function sortProductPricing(a: ProductPricing, b: ProductPricing): number {
 
 const DataContext = createContext<DataContextType | null>(null);
 
+const DEFAULT_DAILY_EMAIL_RECIPIENTS = ['rufus090420@gmail.com'];
+
 export function DataProvider({ children }: { children: ReactNode }) {
   const [branches, setBranches] = useState<Branch[]>([]);
   const [productionHistory, setProductionHistory] = useState<ProductionRecord[]>([]);
@@ -67,6 +71,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [categories, setCategories] = useState<DynamicCategory[]>([]);
   const [availableTags, setAvailableTags] = useState<{ id: string; name: string }[]>([]);
   const [productPricing, setProductPricing] = useState<ProductPricing[]>([]);
+  const [dailyEmailRecipients, setDailyEmailRecipients] = useState<string[]>(DEFAULT_DAILY_EMAIL_RECIPIENTS);
   const initializedRef = useRef(false);
   const categoriesSeededRef = useRef(false);
   const pricingSeededRef = useRef(false);
@@ -216,6 +221,31 @@ export function DataProvider({ children }: { children: ReactNode }) {
       setAvailableTags(tags);
     });
     return () => unsubscribe();
+  }, []);
+
+  // Real-time listener for daily email report settings. The Resend API key is never stored here.
+  useEffect(() => {
+    const settingsRef = ref(db, DAILY_EMAIL_REPORT_SETTINGS_PATH);
+    const unsubscribe = onValue(settingsRef, (snapshot) => {
+      const data = snapshot.val();
+      const recipients = Array.isArray(data?.recipients)
+        ? data.recipients.filter((email: unknown): email is string => typeof email === 'string' && email.includes('@'))
+        : DEFAULT_DAILY_EMAIL_RECIPIENTS;
+      setDailyEmailRecipients(recipients.length > 0 ? recipients : DEFAULT_DAILY_EMAIL_RECIPIENTS);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const updateDailyEmailRecipients = useCallback(async (recipients: string[]) => {
+    const cleanedRecipients = Array.from(new Set(recipients.map(email => email.trim()).filter(Boolean)));
+    await safeSetPath(
+      DAILY_EMAIL_REPORT_SETTINGS_PATH,
+      {
+        recipients: cleanedRecipients.length > 0 ? cleanedRecipients : DEFAULT_DAILY_EMAIL_RECIPIENTS,
+        updatedAt: new Date().toISOString(),
+      },
+      { action: 'set', entity: 'admin-settings', reason: 'update daily email report recipients' }
+    );
   }, []);
 
   const refresh = useCallback(async () => {
@@ -415,6 +445,8 @@ export function DataProvider({ children }: { children: ReactNode }) {
         categories,
         availableTags,
         productPricing,
+        dailyEmailRecipients,
+        updateDailyEmailRecipients,
         addBranch,
         updateBranchName,
         removeBranch,
