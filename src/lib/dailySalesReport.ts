@@ -1,7 +1,7 @@
 import jsPDF from 'jspdf';
 import { autoTable } from 'jspdf-autotable';
-import { Branch, SalesEntry } from './types';
-import { ProductPricing, PRODUCT_PRICING, getSalePurchasePrice } from './pricing';
+import { Branch, ProductionRecord, SalesEntry, TransferRecord } from './types';
+import { ProductPricing, PRODUCT_PRICING, getPurchasePrice, getSalePurchasePrice } from './pricing';
 
 declare module 'jspdf' {
   interface jsPDF {
@@ -38,6 +38,17 @@ export type DailySalesReportData = {
   totalCollection: number;
   totalProfit: number;
   topSellingProducts: TopSellingProduct[];
+};
+
+export type DailyReportAttachment = {
+  filename: string;
+  content: ArrayBuffer;
+};
+
+export type FullDailyReportPackage = {
+  date: string;
+  salesReport: DailySalesReportData;
+  attachments: DailyReportAttachment[];
 };
 
 export function formatIstDate(date = new Date()): string {
@@ -91,6 +102,16 @@ export function normalizeProductPricingFromFirebase(value: unknown): ProductPric
   const pricing = listFromFirebaseValue<ProductPricing>(value)
     .filter(item => item && typeof item.product === 'string' && typeof item.color === 'string' && typeof item.size === 'string');
   return pricing.length > 0 ? pricing : PRODUCT_PRICING;
+}
+
+export function normalizeProductionHistoryFromFirebase(value: unknown): ProductionRecord[] {
+  return listFromFirebaseValue<ProductionRecord>(value)
+    .filter(item => typeof item.date === 'string' && typeof item.branchName === 'string');
+}
+
+export function normalizeTransferHistoryFromFirebase(value: unknown): TransferRecord[] {
+  return listFromFirebaseValue<TransferRecord>(value)
+    .filter(item => typeof item.date === 'string' && typeof item.fromBranchName === 'string');
 }
 
 export function buildDailySalesReport(
@@ -305,6 +326,12 @@ function addSalesTable(doc: jsPDF, sales: SaleWithBranch[], pricing: ProductPric
   });
 }
 
+function createBaseReport(title: string, date: string, branchName = 'All Branches') {
+  const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+  addHeader(doc, title, date, branchName);
+  return doc;
+}
+
 export function createDailySalesPdf(
   report: DailySalesReportData,
   options: { branchId?: string; pricing?: ProductPricing[] } = {}
@@ -343,4 +370,223 @@ export function createDailySalesPdfAttachments(report: DailySalesReportData, pri
     })),
   ];
   return attachments;
+}
+
+export function createStockReportPdf(branches: Branch[], date: string, pricing: ProductPricing[] = PRODUCT_PRICING) {
+  const doc = createBaseReport('Stock Report', date);
+  const rows = branches.flatMap(branch => {
+    const latestEntry = [...branch.dateEntries].sort((a, b) => b.date.localeCompare(a.date))[0];
+    if (!latestEntry) {
+      return [[branch.name, '-', '-', '-', '0', formatCurrency(0), formatCurrency(0), 'No stock entry']];
+    }
+    const stockRows = latestEntry.stock
+      .filter(item => item.quantity > 0)
+      .map(item => {
+        const purchasePrice = getPurchasePrice(item.category, item.color, item.shelfSize || '', pricing);
+        return [
+          branch.name,
+          item.category,
+          item.shelfSize || '-',
+          item.color,
+          item.quantity.toString(),
+          formatCurrency(purchasePrice),
+          formatCurrency(purchasePrice * item.quantity),
+          latestEntry.date,
+        ];
+      });
+    return stockRows.length > 0
+      ? stockRows
+      : [[branch.name, '-', '-', '-', '0', formatCurrency(0), formatCurrency(0), `No stock on ${latestEntry.date}`]];
+  });
+  const totalQty = branches.reduce((sum, branch) => {
+    const latestEntry = [...branch.dateEntries].sort((a, b) => b.date.localeCompare(a.date))[0];
+    return sum + (latestEntry?.stock.reduce((stockSum, item) => stockSum + item.quantity, 0) || 0);
+  }, 0);
+
+  autoTable(doc, {
+    startY: 54,
+    theme: 'grid',
+    margin: { left: 14, right: 14 },
+    styles: { fontSize: 8, cellPadding: 2 },
+    body: [['Current Stock Quantity', totalQty.toLocaleString('en-IN'), 'Branches', branches.length.toLocaleString('en-IN')]],
+    columnStyles: {
+      0: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      1: { halign: 'right' },
+      2: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      3: { halign: 'right' },
+    },
+  });
+  autoTable(doc, {
+    startY: (doc.lastAutoTable?.finalY || 66) + 8,
+    margin: { left: 14, right: 14, bottom: 16 },
+    theme: 'striped',
+    styles: { fontSize: 7, cellPadding: 1.8 },
+    headStyles: { fillColor: [31, 41, 55], textColor: 255, fontStyle: 'bold' },
+    head: [['Branch', 'Product', 'Size', 'Color', 'Qty', 'Purchase Price', 'Total Value', 'Stock Date']],
+    body: rows,
+    columnStyles: {
+      4: { halign: 'right' },
+      5: { halign: 'right' },
+      6: { halign: 'right' },
+    },
+  });
+  addPageNumbers(doc);
+  return doc;
+}
+
+export function createProductionHistoryPdf(records: ProductionRecord[], date: string) {
+  const doc = createBaseReport('Production History', date);
+  const todayRecords = records.filter(record => record.date === date);
+  const totalQty = todayRecords.reduce((sum, record) => sum + record.quantity, 0);
+  autoTable(doc, {
+    startY: 54,
+    theme: 'grid',
+    margin: { left: 14, right: 14 },
+    styles: { fontSize: 8, cellPadding: 2 },
+    body: [['Production receive entries', todayRecords.length.toString(), 'Total quantity', totalQty.toLocaleString('en-IN')]],
+    columnStyles: {
+      0: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      1: { halign: 'right' },
+      2: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      3: { halign: 'right' },
+    },
+  });
+  autoTable(doc, {
+    startY: (doc.lastAutoTable?.finalY || 66) + 8,
+    margin: { left: 14, right: 14, bottom: 16 },
+    theme: 'striped',
+    styles: { fontSize: 7, cellPadding: 1.8 },
+    headStyles: { fillColor: [31, 41, 55], textColor: 255, fontStyle: 'bold' },
+    head: [['Date', 'Branch', 'From', 'Product', 'Size', 'Color', 'Quantity']],
+    body: todayRecords.length > 0
+      ? todayRecords.map(record => [record.date, record.branchName, record.fromName || '-', record.product, record.shelfSize || '-', record.color, record.quantity.toString()])
+      : [[date, '-', '-', '-', '-', '-', 'No production receive entries today']],
+    columnStyles: { 6: { halign: 'right' } },
+  });
+  addPageNumbers(doc);
+  return doc;
+}
+
+export function createDriverChargeReportPdf(report: DailySalesReportData) {
+  const doc = createBaseReport('Driver Charge Report', report.date);
+  const driverRows = new Map<string, { trips: number; charges: number; collection: number }>();
+  report.allSales.forEach(sale => {
+    const name = sale.driverName || 'Unassigned';
+    const current = driverRows.get(name) || { trips: 0, charges: 0, collection: 0 };
+    current.trips += 1;
+    current.charges += sale.driverCharge;
+    current.collection += sale.collection;
+    driverRows.set(name, current);
+  });
+  const rows = Array.from(driverRows.entries()).sort((a, b) => b[1].charges - a[1].charges);
+  autoTable(doc, {
+    startY: 54,
+    theme: 'grid',
+    margin: { left: 14, right: 14 },
+    styles: { fontSize: 8, cellPadding: 2 },
+    body: [
+      ['Total trips', report.allSales.length.toString(), 'Total driver charges', formatCurrency(report.allSales.reduce((sum, sale) => sum + sale.driverCharge, 0))],
+    ],
+    columnStyles: {
+      0: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      1: { halign: 'right' },
+      2: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      3: { halign: 'right' },
+    },
+  });
+  autoTable(doc, {
+    startY: (doc.lastAutoTable?.finalY || 66) + 8,
+    margin: { left: 14, right: 14, bottom: 16 },
+    theme: 'striped',
+    styles: { fontSize: 7, cellPadding: 1.8 },
+    headStyles: { fillColor: [31, 41, 55], textColor: 255, fontStyle: 'bold' },
+    head: [['Driver Name', 'Trips', 'Driver Charges', 'Collection']],
+    body: rows.length > 0
+      ? rows.map(([name, data]) => [name, data.trips.toString(), formatCurrency(data.charges), formatCurrency(data.collection)])
+      : [['No driver charges today', '0', formatCurrency(0), formatCurrency(0)]],
+    columnStyles: {
+      1: { halign: 'right' },
+      2: { halign: 'right' },
+      3: { halign: 'right' },
+    },
+  });
+  addPageNumbers(doc);
+  return doc;
+}
+
+export function createTransferHistoryPdf(records: TransferRecord[], date: string) {
+  const doc = createBaseReport('Transfer History', date);
+  const todayRecords = records.filter(record => record.date === date);
+  const totalQty = todayRecords.reduce((sum, record) => sum + record.quantity, 0);
+  autoTable(doc, {
+    startY: 54,
+    theme: 'grid',
+    margin: { left: 14, right: 14 },
+    styles: { fontSize: 8, cellPadding: 2 },
+    body: [['Transfer entries', todayRecords.length.toString(), 'Total quantity', totalQty.toLocaleString('en-IN')]],
+    columnStyles: {
+      0: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      1: { halign: 'right' },
+      2: { fontStyle: 'bold', fillColor: [245, 247, 250] },
+      3: { halign: 'right' },
+    },
+  });
+  autoTable(doc, {
+    startY: (doc.lastAutoTable?.finalY || 66) + 8,
+    margin: { left: 14, right: 14, bottom: 16 },
+    theme: 'striped',
+    styles: { fontSize: 7, cellPadding: 1.8 },
+    headStyles: { fillColor: [31, 41, 55], textColor: 255, fontStyle: 'bold' },
+    head: [['Date', 'Type', 'From', 'To', 'Product', 'Size', 'Color', 'Quantity']],
+    body: todayRecords.length > 0
+      ? todayRecords.map(record => [
+          record.date,
+          record.type === 'internal' ? 'Internal' : 'External',
+          record.fromBranchName,
+          record.type === 'external' ? (record.externalName || 'External') : (record.toBranchName || '-'),
+          record.product,
+          record.shelfSize || '-',
+          record.color,
+          record.quantity.toString(),
+        ])
+      : [[date, '-', '-', '-', '-', '-', '-', 'No transfers today']],
+    columnStyles: { 7: { halign: 'right' } },
+  });
+  addPageNumbers(doc);
+  return doc;
+}
+
+export function createFullDailyReportPackage(input: {
+  branches: Branch[];
+  productionHistory: ProductionRecord[];
+  transferHistory: TransferRecord[];
+  date: string;
+  pricing?: ProductPricing[];
+}): FullDailyReportPackage {
+  const pricing = input.pricing || PRODUCT_PRICING;
+  const salesReport = buildDailySalesReport(input.branches, input.date, pricing);
+  const attachments: DailyReportAttachment[] = [
+    ...createDailySalesPdfAttachments(salesReport, pricing),
+    {
+      filename: `DYNAMIC-Stock-Report-${input.date}.pdf`,
+      content: createStockReportPdf(input.branches, input.date, pricing).output('arraybuffer'),
+    },
+    {
+      filename: `DYNAMIC-Production-History-${input.date}.pdf`,
+      content: createProductionHistoryPdf(input.productionHistory, input.date).output('arraybuffer'),
+    },
+    {
+      filename: `DYNAMIC-Driver-Charge-Report-${input.date}.pdf`,
+      content: createDriverChargeReportPdf(salesReport).output('arraybuffer'),
+    },
+    {
+      filename: `DYNAMIC-Transfer-History-${input.date}.pdf`,
+      content: createTransferHistoryPdf(input.transferHistory, input.date).output('arraybuffer'),
+    },
+  ];
+  return {
+    date: input.date,
+    salesReport,
+    attachments,
+  };
 }

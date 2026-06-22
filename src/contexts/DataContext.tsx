@@ -231,7 +231,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
       const recipients = Array.isArray(data?.recipients)
         ? data.recipients.filter((email: unknown): email is string => typeof email === 'string' && email.includes('@'))
         : DEFAULT_DAILY_EMAIL_RECIPIENTS;
-      setDailyEmailRecipients(recipients.length > 0 ? recipients : DEFAULT_DAILY_EMAIL_RECIPIENTS);
+      setDailyEmailRecipients(recipients);
     });
     return () => unsubscribe();
   }, []);
@@ -241,7 +241,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
     await safeSetPath(
       DAILY_EMAIL_REPORT_SETTINGS_PATH,
       {
-        recipients: cleanedRecipients.length > 0 ? cleanedRecipients : DEFAULT_DAILY_EMAIL_RECIPIENTS,
+        recipients: cleanedRecipients,
         updatedAt: new Date().toISOString(),
       },
       { action: 'set', entity: 'admin-settings', reason: 'update daily email report recipients' }

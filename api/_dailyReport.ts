@@ -4,41 +4,47 @@ import {
   EMAIL_REPORT_LOGS_PATH,
   PRODUCT_PRICING_PATH,
   PRODUCTS_PATH,
+  PRODUCTION_HISTORY_PATH,
+  TRANSFER_HISTORY_PATH,
   db,
 } from '../src/lib/firebase';
 import {
-  buildDailySalesReport,
-  createDailySalesPdfAttachments,
+  createFullDailyReportPackage,
   formatIstDate,
   normalizeBranchesFromFirebase,
+  normalizeProductionHistoryFromFirebase,
   normalizeProductPricingFromFirebase,
+  normalizeTransferHistoryFromFirebase,
 } from '../src/lib/dailySalesReport';
 
 export const DEFAULT_DAILY_REPORT_RECIPIENTS = ['rufus090420@gmail.com'];
 
 type EmailReportLog = {
+  triggeredBy: 'manual' | 'cron' | 'test';
   date: string;
   time: string;
-  status: 'success' | 'error';
+  status: 'success' | 'failure';
   attempt: number;
-  recipientList: string[];
+  recipientEmails: string[];
+  attachmentNames: string[];
   attachedPdfCount: number;
-  successResponse?: unknown;
+  resendResponseId?: string;
+  resendResponse?: unknown;
   errorMessage?: string;
-  trigger?: 'cron' | 'test';
 };
 
-function getRecipients(settings: unknown): string[] {
-  const recipients = Array.isArray((settings as { recipients?: unknown[] } | null)?.recipients)
+export function getRecipients(settings: unknown): string[] {
+  if (!settings) return DEFAULT_DAILY_REPORT_RECIPIENTS;
+  const recipients = Array.isArray((settings as { recipients?: unknown[] }).recipients)
     ? (settings as { recipients: unknown[] }).recipients
-    : DEFAULT_DAILY_REPORT_RECIPIENTS;
+    : [];
   const cleaned = Array.from(new Set(
     recipients
       .filter((email): email is string => typeof email === 'string')
       .map(email => email.trim())
       .filter(email => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
   ));
-  return cleaned.length > 0 ? cleaned : DEFAULT_DAILY_REPORT_RECIPIENTS;
+  return cleaned;
 }
 
 async function writeEmailReportLog(log: EmailReportLog) {
@@ -84,46 +90,65 @@ async function sendWithResend(input: {
 export async function runDailyReportEmail(options: {
   date?: string;
   recipients?: string[];
-  trigger: 'cron' | 'test';
+  triggeredBy: 'manual' | 'cron' | 'test';
 }) {
   const reportDate = options.date || formatIstDate();
   let recipients = options.recipients || DEFAULT_DAILY_REPORT_RECIPIENTS;
   let attachedPdfCount = 0;
+  let attachmentNames: string[] = [];
 
   try {
-    const [productsSnapshot, pricingSnapshot, settingsSnapshot] = await Promise.all([
+    const [productsSnapshot, pricingSnapshot, settingsSnapshot, productionSnapshot, transferSnapshot] = await Promise.all([
       get(ref(db, PRODUCTS_PATH)),
       get(ref(db, PRODUCT_PRICING_PATH)),
       get(ref(db, DAILY_EMAIL_REPORT_SETTINGS_PATH)),
+      get(ref(db, PRODUCTION_HISTORY_PATH)),
+      get(ref(db, TRANSFER_HISTORY_PATH)),
     ]);
 
     const branches = normalizeBranchesFromFirebase(productsSnapshot.val());
     const pricing = normalizeProductPricingFromFirebase(pricingSnapshot.val());
+    const productionHistory = normalizeProductionHistoryFromFirebase(productionSnapshot.val());
+    const transferHistory = normalizeTransferHistoryFromFirebase(transferSnapshot.val());
     recipients = options.recipients || getRecipients(settingsSnapshot.val());
-    const report = buildDailySalesReport(branches, reportDate, pricing);
-    const attachments = createDailySalesPdfAttachments(report, pricing);
+    if (recipients.length === 0) {
+      throw new Error('No daily email report recipients configured.');
+    }
+    const reportPackage = createFullDailyReportPackage({
+      branches,
+      productionHistory,
+      transferHistory,
+      date: reportDate,
+      pricing,
+    });
+    const attachments = reportPackage.attachments;
     attachedPdfCount = attachments.length;
+    attachmentNames = attachments.map(attachment => attachment.filename);
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
         const resendResponse = await sendWithResend({ recipients, date: reportDate, attachments });
         await writeEmailReportLog({
+          triggeredBy: options.triggeredBy,
           date: reportDate,
           time: new Date().toISOString(),
           status: 'success',
           attempt,
-          recipientList: recipients,
+          recipientEmails: recipients,
+          attachmentNames,
           attachedPdfCount,
-          successResponse: resendResponse,
-          trigger: options.trigger,
+          resendResponseId: typeof resendResponse?.id === 'string' ? resendResponse.id : undefined,
+          resendResponse,
         });
         return {
           ok: true,
           date: reportDate,
+          triggeredBy: options.triggeredBy,
           recipients,
+          attachmentNames,
           attachedPdfCount,
-          branchCount: report.branches.length,
-          branchesWithNoSales: report.branches.filter(branch => branch.noSales).map(branch => branch.branchName),
+          branchCount: reportPackage.salesReport.branches.length,
+          branchesWithNoSales: reportPackage.salesReport.branches.filter(branch => branch.noSales).map(branch => branch.branchName),
           envDetected: {
             RESEND_API_KEY: Boolean(process.env.RESEND_API_KEY),
             RESEND_FROM_EMAIL: Boolean(process.env.RESEND_FROM_EMAIL),
@@ -134,14 +159,15 @@ export async function runDailyReportEmail(options: {
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
         await writeEmailReportLog({
+          triggeredBy: options.triggeredBy,
           date: reportDate,
           time: new Date().toISOString(),
-          status: 'error',
+          status: 'failure',
           attempt,
-          recipientList: recipients,
+          recipientEmails: recipients,
+          attachmentNames,
           attachedPdfCount,
           errorMessage,
-          trigger: options.trigger,
         });
         if (attempt === 2) throw error;
       }
@@ -150,14 +176,15 @@ export async function runDailyReportEmail(options: {
     const errorMessage = error instanceof Error ? error.message : String(error);
     if (attachedPdfCount === 0) {
       await writeEmailReportLog({
+        triggeredBy: options.triggeredBy,
         date: reportDate,
         time: new Date().toISOString(),
-        status: 'error',
+        status: 'failure',
         attempt: 1,
-        recipientList: recipients,
+        recipientEmails: recipients,
+        attachmentNames,
         attachedPdfCount,
         errorMessage,
-        trigger: options.trigger,
       }).catch(logError => console.error('Failed to log email report error:', logError));
     }
     throw error;

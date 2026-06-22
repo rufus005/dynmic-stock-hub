@@ -9,7 +9,7 @@ export default async function handler(request: any, response: any) {
   try {
     const result = await runDailyReportEmail({
       date: typeof request.query?.date === 'string' ? request.query.date : undefined,
-      trigger: 'cron',
+      triggeredBy: 'cron',
     });
     response.status(200).json(result);
   } catch (error) {

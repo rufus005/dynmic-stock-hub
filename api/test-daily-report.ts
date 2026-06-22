@@ -16,7 +16,7 @@ export default async function handler(request: any, response: any) {
     const result = await runDailyReportEmail({
       date: formatIstDate(),
       recipients: DEFAULT_DAILY_REPORT_RECIPIENTS,
-      trigger: 'test',
+      triggeredBy: 'test',
     });
     response.status(200).json({
       ...result,
